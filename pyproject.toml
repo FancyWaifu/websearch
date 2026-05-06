@@ -1,0 +1,21 @@
+[project]
+name = "websearch"
+version = "0.1.0"
+description = "Better web search and fetch CLI for use by AI assistants and humans"
+requires-python = ">=3.10"
+dependencies = [
+    "requests[socks]>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "trafilatura>=1.12",
+]
+
+[project.scripts]
+websearch = "websearch.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["websearch*"]

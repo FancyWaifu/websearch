@@ -439,6 +439,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     proxy = args.proxy
     cache = _resolve_cache(args)
     bkwargs = _body_kwargs(args)
+    verify = not getattr(args, "insecure", False)
 
     # Single URL
     if len(args.urls) == 1:
@@ -449,6 +450,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             cache=cache,
             max_age=args.max_age,
             refresh=args.refresh,
+            verify=verify,
         )
         if args.via == "direct":
             result = fetch_direct(url, **kwargs)
@@ -485,6 +487,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         cache=cache,
         max_age=args.max_age,
         refresh=args.refresh,
+        verify=verify,
     )
 
     if args.json:
@@ -531,14 +534,6 @@ def cmd_text(args: argparse.Namespace) -> int:
     args.parallel = 4
     args.urls = [args.url]
     args.compact = False
-    if not hasattr(args, "skip_chars"):
-        args.skip_chars = 0
-    if not hasattr(args, "mode"):
-        args.mode = "article"
-    if not hasattr(args, "grep"):
-        args.grep = None
-    if not hasattr(args, "grep_context"):
-        args.grep_context = 2
     return cmd_fetch(args)
 
 
@@ -787,6 +782,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["article", "tables", "raw"],
         default="article",
     )
+    t.add_argument(
+        "--insecure",
+        "-k",
+        action="store_true",
+        help="disable TLS certificate verification (use sparingly)",
+    )
+    _add_body_args(t)
     _add_proxy_arg(t)
     _add_cache_args(t)
     t.set_defaults(func=cmd_text)

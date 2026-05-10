@@ -5,14 +5,17 @@ import json
 import os
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .cache import Cache, default as default_cache
 from . import pdfx
@@ -68,12 +71,35 @@ def _proxies(proxy: Optional[str] = None) -> Optional[dict]:
 # A module-level Session reuses connections and cookies across calls
 # within one process invocation. Cleared on process exit.
 _session: Optional[requests.Session] = None
+_session_lock = threading.Lock()
+
+
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    # Retry transient failures: connect errors, read errors, and 5xx + 429.
+    # POST is included so DDG search (which uses POST) gets the same treatment.
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST", "HEAD"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=16)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
 
 
 def session() -> requests.Session:
     global _session
     if _session is None:
-        _session = requests.Session()
+        with _session_lock:
+            if _session is None:
+                _session = _build_session()
     return _session
 
 
@@ -270,11 +296,12 @@ def fetch_wayback(
     cache: Optional[Cache] = None,
     max_age: Optional[float] = None,
     refresh: bool = False,
+    verify: bool = True,
 ) -> FetchResult:
     """Fetch the latest archived snapshot from the Wayback Machine."""
     api = f"https://archive.org/wayback/available?url={quote_plus(url)}"
     try:
-        r = _do_request("GET", api, timeout, proxy)
+        r = _do_request("GET", api, timeout, proxy, verify=verify)
         data = r.json()
         snap = data.get("archived_snapshots", {}).get("closest")
         if not snap or not snap.get("available"):
@@ -282,7 +309,8 @@ def fetch_wayback(
         snap_url = snap["url"]
         # Reuse fetch_direct so the snapshot itself benefits from cache
         snap_res = fetch_direct(
-            snap_url, timeout=timeout, proxy=proxy, cache=cache, max_age=max_age, refresh=refresh
+            snap_url, timeout=timeout, proxy=proxy, cache=cache, max_age=max_age,
+            refresh=refresh, verify=verify,
         )
         snap_res.url = url
         snap_res.via = "wayback"
@@ -298,30 +326,32 @@ def fetch_smart(
     cache: Optional[Cache] = None,
     max_age: Optional[float] = None,
     refresh: bool = False,
+    verify: bool = True,
 ) -> FetchResult:
     """Try direct first; on 4xx/5xx or network error, fall back to Wayback.
 
-    If Wayback is tried, the attempt result is recorded on the returned
-    FetchResult (tried_wayback, wayback_status, wayback_error) regardless
-    of which result is returned. This makes failures debuggable.
+    The wayback annotation fields (tried_wayback, wayback_status, wayback_error)
+    are only set when wayback was used as a *fallback*. If the direct fetch
+    succeeded or wayback is the final source, those fields stay clean.
     """
     direct = fetch_direct(
-        url, timeout=timeout, proxy=proxy, cache=cache, max_age=max_age, refresh=refresh
+        url, timeout=timeout, proxy=proxy, cache=cache, max_age=max_age,
+        refresh=refresh, verify=verify,
     )
     if direct.status and direct.status < 400 and direct.text:
         return direct
 
-    # Direct failed — try Wayback and record what happened
+    # Direct failed — try Wayback
     wb = fetch_wayback(
-        url, timeout=timeout, proxy=proxy, cache=cache, max_age=max_age, refresh=refresh
+        url, timeout=timeout, proxy=proxy, cache=cache, max_age=max_age,
+        refresh=refresh, verify=verify,
     )
 
     if wb.status and wb.status < 400 and wb.text:
-        wb.tried_wayback = True
-        wb.wayback_status = wb.status
         return wb
 
-    # Both failed — return the more informative one but annotate
+    # Both failed — return the more informative one and annotate the
+    # wayback attempt so callers can see what happened.
     chosen = direct if direct.status else wb
     chosen.tried_wayback = True
     chosen.wayback_status = wb.status
@@ -338,6 +368,7 @@ def fetch_many(
     cache: Optional[Cache] = None,
     max_age: Optional[float] = None,
     refresh: bool = False,
+    verify: bool = True,
 ) -> list[FetchResult]:
     """Fetch many URLs concurrently. Preserves input order in the result."""
     fns = {"smart": fetch_smart, "direct": fetch_direct, "wayback": fetch_wayback}
@@ -354,6 +385,7 @@ def fetch_many(
                 cache=cache,
                 max_age=max_age,
                 refresh=refresh,
+                verify=verify,
             ): i
             for i, url in enumerate(urls)
         }
@@ -375,7 +407,7 @@ def download(
     timeout: int = 120,
     proxy: Optional[str] = None,
     chunk_size: int = 64 * 1024,
-    progress: Optional[callable] = None,
+    progress: Optional[Callable[[int, Optional[int]], None]] = None,
 ) -> tuple[int, int]:
     """Stream a URL to disk. Returns (status_code, bytes_written).
 

@@ -1,6 +1,6 @@
 [project]
 name = "websearch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Better web search and fetch CLI for use by AI assistants and humans"
 requires-python = ">=3.10"
 dependencies = [
@@ -9,6 +9,9 @@ dependencies = [
     "lxml>=5.0",
     "trafilatura>=1.12",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
 
 [project.scripts]
 websearch = "websearch.cli:main"
@@ -19,3 +22,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["websearch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

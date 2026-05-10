@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS responses (
     body        BLOB NOT NULL,
     fetched_at  REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_url ON responses(url);
+-- Drop legacy idx_url: lookups go via the primary key, so this index was
+-- pure write overhead. Safe to remove on existing DBs.
+DROP INDEX IF EXISTS idx_url;
 """
 
 

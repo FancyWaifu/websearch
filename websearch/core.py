@@ -20,6 +20,7 @@ from urllib3.util.retry import Retry
 from .cache import Cache, default as default_cache
 from . import pdfx
 from . import reputation
+from . import transcripts as _transcripts
 
 try:
     import trafilatura  # type: ignore
@@ -201,6 +202,45 @@ NO_RESULTS_PATTERNS = [
 ]
 
 
+# Per-domain circuit breaker: if a host has recently 429'd or returned a
+# block page, skip subsequent direct requests for a short window so we don't
+# pound it and don't waste latency. In-process only — no persistence.
+_DOMAIN_BLOCK_TTL_S = 60.0
+_domain_blocked_until: dict[str, float] = {}
+_domain_lock = threading.Lock()
+
+
+def _host_of(url: str) -> str:
+    try:
+        h = urlparse(url).netloc.lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
+
+def _is_blocked_host(host: str) -> Optional[float]:
+    """Return seconds-until-clear if host is in the backoff window, else None."""
+    if not host:
+        return None
+    with _domain_lock:
+        until = _domain_blocked_until.get(host)
+    if until is None:
+        return None
+    remaining = until - time.time()
+    if remaining <= 0:
+        with _domain_lock:
+            _domain_blocked_until.pop(host, None)
+        return None
+    return remaining
+
+
+def _trip_breaker(host: str, ttl: float = _DOMAIN_BLOCK_TTL_S) -> None:
+    if not host:
+        return
+    with _domain_lock:
+        _domain_blocked_until[host] = time.time() + ttl
+
+
 def _looks_blocked(html: str) -> Optional[str]:
     low = html.lower()
     for pat in BLOCK_PATTERNS:
@@ -250,10 +290,44 @@ def fetch_direct(
                 is_pdf="application/pdf" in (hit.content_type or "").lower(),
             )
 
+    # YouTube short-circuit: HTML body for YouTube is useless. Pull transcript
+    # via yt-dlp and return that as `text` so downstream extraction/grep works.
+    if _transcripts.is_youtube_url(url):
+        body, err = _transcripts.fetch_transcript(url, timeout=timeout)
+        if body:
+            res = FetchResult(
+                url=url, final_url=url, status=200,
+                content_type="text/plain; transcript",
+                text=body, via="direct", error=None,
+            )
+            if cache:
+                cache.put("GET", url, url, 200, res.content_type, body)
+            return res
+        # On transcript failure, fall through to the normal HTML fetch — at
+        # least the page title comes back, and the error is recorded.
+        # (Stash err for the eventual returned FetchResult below.)
+        _yt_error = err
+    else:
+        _yt_error = None
+
+    host = _host_of(url)
+    blocked_remaining = _is_blocked_host(host)
+    if blocked_remaining is not None:
+        return FetchResult(
+            url, url, 0, "", "", "direct",
+            f"backoff: host '{host}' in cooldown for {int(blocked_remaining)}s",
+        )
+
     try:
         r = _do_request("GET", url, timeout, proxy, verify=verify)
     except requests.RequestException as e:
         return FetchResult(url, url, 0, "", "", "direct", str(e))
+
+    # Circuit-breaker triggers: 429 (rate limit) or HTML that smells like a block page.
+    if r.status_code == 429:
+        _trip_breaker(host)
+    elif r.status_code == 200 and r.text and _looks_blocked(r.text):
+        _trip_breaker(host)
 
     content_type = r.headers.get("Content-Type", "")
     is_pdf = pdfx.looks_like_pdf(content_type, r.content[:8] if r.content else None, url)
@@ -266,6 +340,13 @@ def fetch_direct(
     else:
         text = r.text
 
+    err: Optional[str]
+    if r.status_code >= 400:
+        err = f"HTTP {r.status_code}"
+    elif _yt_error:
+        err = f"transcript unavailable: {_yt_error}"
+    else:
+        err = None
     result = FetchResult(
         url=url,
         final_url=r.url,
@@ -273,7 +354,7 @@ def fetch_direct(
         content_type=content_type,
         text=text,
         via="direct",
-        error=None if r.status_code < 400 else f"HTTP {r.status_code}",
+        error=err,
         is_pdf=is_pdf,
     )
     # Only cache successful responses (text-only, including extracted PDF text)
@@ -844,8 +925,29 @@ def search_many(
 # ----------------------------- Selftest ------------------------------------
 
 
+def _fetch_ip(proxy: Optional[str], timeout: int = 10) -> str:
+    """Return the apparent egress IP via api.ipify.org, or '' on failure."""
+    try:
+        s = session()
+        r = s.get(
+            "https://api.ipify.org",
+            headers=_headers(),
+            timeout=timeout,
+            proxies=_proxies(proxy),
+            allow_redirects=True,
+        )
+        return r.text.strip() if r.status_code == 200 else ""
+    except requests.RequestException:
+        return ""
+
+
 def selftest(proxy: Optional[str] = None) -> dict:
-    """Run a quick smoke test of search and fetch parsers. Returns a dict report."""
+    """Run a quick smoke test of search and fetch parsers. Returns a dict report.
+
+    When a proxy is provided (or $WEBSEARCH_PROXY is set), the egress IP is
+    measured both with and without it so that silent fallback to direct is
+    obvious instead of invisible.
+    """
     report: dict = {"timestamp": time.time(), "checks": []}
 
     def check(name: str, fn):
@@ -859,6 +961,22 @@ def selftest(proxy: Optional[str] = None) -> dict:
             entry["error"] = str(e)
         entry["elapsed_s"] = round(time.time() - t0, 2)
         report["checks"].append(entry)
+
+    effective_proxy = proxy or os.environ.get("WEBSEARCH_PROXY")
+    if effective_proxy:
+        direct_ip = _fetch_ip(None)
+        proxy_ip = _fetch_ip(effective_proxy)
+        report["proxy_check"] = {
+            "proxy": effective_proxy,
+            "direct_ip": direct_ip or "?",
+            "proxy_ip": proxy_ip or "?",
+            "different": bool(direct_ip and proxy_ip and direct_ip != proxy_ip),
+            "ok": bool(proxy_ip and proxy_ip != direct_ip),
+        }
+        check(
+            "proxy egress differs from direct",
+            lambda: f"direct={direct_ip or '?'} proxy={proxy_ip or '?'}",
+        )
 
     # Use a generic query — some specific queries trigger captcha challenges.
     q = "wikipedia"
@@ -875,5 +993,10 @@ def selftest(proxy: Optional[str] = None) -> dict:
         lambda: f"status={fetch_smart('https://en.wikipedia.org/wiki/Maimonides', proxy=proxy, cache=None).status}",
     )
     check("trafilatura available", lambda: HAVE_TRAFILATURA)
-    report["ok"] = all(c["ok"] for c in report["checks"])
+    if effective_proxy:
+        # Don't fail the whole selftest on proxy IP equality — many users
+        # legitimately tunnel through the same egress address. Just surface it.
+        report["ok"] = all(c["ok"] for c in report["checks"] if "proxy egress" not in c["name"])
+    else:
+        report["ok"] = all(c["ok"] for c in report["checks"])
     return report

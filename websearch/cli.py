@@ -6,24 +6,42 @@ import json
 import sys
 import time
 
-from . import __version__
-from .cache import default as default_cache
-from .core import (
-    download,
-    extract_title,
-    fetch_direct,
-    fetch_many,
-    fetch_smart,
-    fetch_wayback,
-    grep_lines,
-    html_to_text,
-    search_bing,
-    search_duckduckgo,
-    search_many,
-    search_smart,
-    selftest,
-)
-from . import reputation
+try:
+    from . import __version__
+    from .cache import default as default_cache
+    from .core import (
+        download,
+        extract_title,
+        fetch_direct,
+        fetch_many,
+        fetch_smart,
+        fetch_wayback,
+        grep_lines,
+        html_to_text,
+        search_bing,
+        search_duckduckgo,
+        search_many,
+        search_smart,
+        selftest,
+    )
+    from . import reputation
+    from . import rerank as _rerank
+    from . import doctor as _doctor
+    from . import dates as _dates
+    from . import pdfx as _pdfx
+except ImportError as _imp_err:
+    sys.stderr.write(
+        "websearch: failed to import its own package.\n"
+        f"  Active binary: {sys.argv[0] if sys.argv else '?'}\n"
+        f"  Python:        {sys.executable}\n"
+        f"  Error:         {_imp_err}\n"
+        "\n"
+        "This usually means a stale console-script shim is on PATH from an\n"
+        "older Python install. Reinstall with:\n"
+        "    cd ~/websearch && pipx install -e . --force\n"
+        "Then invoke `~/.local/bin/websearch` directly to bypass any stale shim.\n"
+    )
+    sys.exit(2)
 
 
 # ----------------------------- helpers --------------------------------------
@@ -103,6 +121,58 @@ def _add_body_args(p: argparse.ArgumentParser) -> None:
         default=2,
         help="lines of context around each --grep match (default: 2)",
     )
+    p.add_argument(
+        "--section",
+        default=None,
+        metavar="NAMES",
+        help="comma-separated section names to keep from fetched bodies "
+        "(e.g. 'abstract,conclusion'). Honors aliases for common headings.",
+    )
+
+
+def _add_rerank_args(p: argparse.ArgumentParser) -> None:
+    """Shared search-quality flags: rerank + keyword require."""
+    p.add_argument(
+        "--rerank",
+        action="store_true",
+        help="after dedupe, rerank results by TF-IDF similarity to the "
+        "primary query. Cheap, no model dependency.",
+    )
+    p.add_argument(
+        "--require",
+        action="append",
+        default=[],
+        metavar="TERMS",
+        help="drop results whose title+snippet contains none of these "
+        "comma-separated terms (case-insensitive). Repeatable.",
+    )
+
+
+def _enforce_since(fetched: list, since: str) -> list:
+    """Drop fetched results whose extracted published date is before `since`.
+
+    Results without an extractable date are KEPT (we don't have grounds to
+    drop them, and dropping silently would be worse than leaving them in).
+    """
+    cutoff = _dates.parse_since(since)
+    if not cutoff:
+        return fetched
+    out = []
+    for r in fetched:
+        body = r.text if hasattr(r, "text") else r.get("body") or r.get("text") or ""
+        # Only meaningful on HTML — PDFs and transcripts don't carry these meta tags
+        if not body or body.lstrip().startswith("%PDF"):
+            out.append(r)
+            continue
+        pub = _dates.extract_published(body)
+        if pub is None or pub >= cutoff:
+            # Annotate for the renderer
+            if hasattr(r, "__dict__"):
+                setattr(r, "published_date", pub.isoformat() if pub else None)
+            elif isinstance(r, dict):
+                r["published_date"] = pub.isoformat() if pub else None
+            out.append(r)
+    return out
 
 
 def _postprocess_body(
@@ -115,11 +185,16 @@ def _postprocess_body(
     mode: str,
     grep: str | None = None,
     grep_context: int = 2,
+    section: str | None = None,
 ) -> str:
-    """Apply extraction → grep → truncation to a fetched body."""
+    """Apply extraction → section-filter → grep → truncation to a fetched body."""
     looks_html = "html" in (content_type or "").lower() or body.lstrip().startswith("<")
     if not raw and looks_html:
         body = html_to_text(body, max_chars=None, skip_chars=skip_chars, mode=mode)
+    if section:
+        sections = [s.strip() for s in section.split(",") if s.strip()]
+        if sections:
+            body = _pdfx.extract_sections(body, sections)
     if grep:
         filtered = grep_lines(body, grep, context=grep_context)
         body = filtered if filtered else f"[no lines matched /{grep}/]"
@@ -259,6 +334,7 @@ def _body_kwargs(args: argparse.Namespace) -> dict:
         mode=args.mode,
         grep=getattr(args, "grep", None),
         grep_context=getattr(args, "grep_context", 2),
+        section=getattr(args, "section", None),
     )
 
 
@@ -295,6 +371,11 @@ def cmd_search(args: argparse.Namespace) -> int:
         prefer=args.prefer,
     )
 
+    require_terms: list[str] = []
+    for r in (getattr(args, "require", None) or []):
+        require_terms.extend([t.strip() for t in r.split(",") if t.strip()])
+    do_rerank = getattr(args, "rerank", False)
+
     # Multi-query path
     if len(queries) > 1:
         report = search_many(
@@ -306,6 +387,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             exclude=exclude or None,
             **filter_kwargs,
         )
+        _apply_rerank_pipeline(report, queries[0], require_terms, do_rerank)
         if args.fetch_top and report.get("unique"):
             top_urls = [r["url"] for r in report["unique"][: args.fetch_top]]
             fetched = fetch_many(
@@ -347,6 +429,25 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"search failed: {e}", file=sys.stderr)
         return 1
 
+    # Optional rerank + require on the single-query result set.
+    if require_terms or do_rerank:
+        dicts = [r.to_dict() for r in results]
+        if require_terms:
+            dicts = _rerank.filter_required(dicts, require_terms)
+        if do_rerank:
+            dicts = _rerank.rerank(dicts, query)
+        # Reflect back into SearchResult list to keep downstream code uniform
+        rebuilt = []
+        for d in dicts:
+            from .core import SearchResult as _SR
+            rebuilt.append(_SR(
+                rank=d.get("rank", 0),
+                title=d.get("title", ""),
+                url=d.get("url", ""),
+                snippet=d.get("snippet", ""),
+            ))
+        results = rebuilt
+
     if args.fetch_top and results:
         top_urls = [r.url for r in results[: args.fetch_top]]
         fetched = fetch_many(
@@ -381,8 +482,51 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_rerank_pipeline(
+    report: dict, primary_query: str, require_terms: list[str], do_rerank: bool
+) -> dict:
+    """Cross-query boost → require-keyword filter → optional TF-IDF rerank.
+
+    Mutates `report['unique']` and re-ranks 1..N.
+    """
+    merged = report.get("unique", [])
+    if not merged:
+        return report
+    if len(report.get("queries", {})) > 1:
+        merged = _rerank.boost_by_query_count(report["queries"], merged)
+    if require_terms:
+        merged = _rerank.filter_required(merged, require_terms)
+    if do_rerank and primary_query:
+        merged = _rerank.rerank(merged, primary_query)
+    report["unique"] = merged
+    return report
+
+
+def _research_frontmatter(args: argparse.Namespace, queries: list[str], report: dict) -> str:
+    """YAML frontmatter for piping research output into notes systems."""
+    import datetime as _dt
+    proxy_used = bool(args.proxy or __import__("os").environ.get("WEBSEARCH_PROXY"))
+    unique = report.get("unique", []) or []
+    fetched = report.get("fetched", []) or []
+    fm = [
+        "---",
+        f"title: {json.dumps(queries[0])}",
+        f"timestamp: {_dt.datetime.now().isoformat(timespec='seconds')}",
+        f"trust: {args.trust}",
+        f"depth: {args.depth}",
+        f"proxy_used: {str(proxy_used).lower()}",
+        f"sources_unique: {len(unique)}",
+        f"sources_fetched: {len(fetched)}",
+        "queries:",
+    ]
+    for q in queries:
+        fm.append(f"  - {json.dumps(q)}")
+    fm.append("---")
+    return "\n".join(fm)
+
+
 def cmd_research(args: argparse.Namespace) -> int:
-    """Preset: multi-query search → fetch top N → compact markdown.
+    """Preset: multi-query search → fetch top N → compact markdown or JSON.
 
     Matches the real research workflow: ask a question, have the tool
     pull trusted sources, and hand back one clean document instead of
@@ -403,6 +547,10 @@ def cmd_research(args: argparse.Namespace) -> int:
     for e in args.exclude or []:
         exclude.extend([x.strip() for x in e.split(",") if x.strip()])
 
+    require_terms: list[str] = []
+    for r in (args.require or []):
+        require_terms.extend([t.strip() for t in r.split(",") if t.strip()])
+
     report = search_many(
         queries,
         max_results=args.max,
@@ -415,6 +563,8 @@ def cmd_research(args: argparse.Namespace) -> int:
         prefer=args.prefer,
     )
 
+    _apply_rerank_pipeline(report, queries[0], require_terms, args.rerank)
+
     if report.get("unique"):
         top_urls = [r["url"] for r in report["unique"][: args.depth]]
         fetched = fetch_many(
@@ -426,12 +576,30 @@ def cmd_research(args: argparse.Namespace) -> int:
             max_age=args.max_age,
             refresh=args.refresh,
         )
+        if args.enforce_since and args.since:
+            fetched = _enforce_since(fetched, args.since)
         _attach_fetched(report, fetched, args)
+
+    if args.format == "json":
+        out = {
+            "queries": queries,
+            "trust": args.trust,
+            "depth": args.depth,
+            "results": report.get("unique", []),
+            "fetched": report.get("fetched", []),
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
 
     header = f"Research: {queries[0]}"
     if len(queries) > 1:
         header += f"  (+{len(queries)-1} related)"
-    print(_render_compact_report(report, header=header))
+    parts: list[str] = []
+    if not args.no_frontmatter:
+        parts.append(_research_frontmatter(args, queries, report))
+        parts.append("")
+    parts.append(_render_compact_report(report, header=header))
+    print("\n".join(parts))
     return 0
 
 
@@ -633,6 +801,34 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Print install / PATH / proxy / tool-availability diagnosis."""
+    rep = _doctor.report(proxy=args.proxy)
+    if args.json:
+        print(json.dumps(rep, indent=2, default=str))
+    else:
+        print(_doctor.format_human(rep))
+    # Exit non-zero if proxy is configured-but-unreachable, since that's
+    # a silent-fallback foot-gun the user explicitly chose to set up.
+    pr = rep.get("proxy", {})
+    if pr.get("configured") and not pr.get("reachable", True):
+        return 1
+    return 0
+
+
+def cmd_reputation(args: argparse.Namespace) -> int:
+    if args.action == "explain":
+        result = reputation.explain(args.url)
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.action == "list":
+        data = reputation.list_category(args.category)
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f"unknown reputation action: {args.action}", file=sys.stderr)
+    return 2
+
+
 # ----------------------------- parser ---------------------------------------
 
 
@@ -714,6 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_filter_args(s)
     _add_body_args(s)
+    _add_rerank_args(s)
     _add_proxy_arg(s)
     _add_cache_args(s)
     s.set_defaults(func=cmd_search)
@@ -834,8 +1031,27 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DOMAIN",
         help="exclude results from this domain (repeatable/comma-separated)",
     )
+    rs.add_argument(
+        "--format",
+        choices=["md", "json"],
+        default="md",
+        help="output format: 'md' compact markdown (default) or 'json' structured envelope",
+    )
+    rs.add_argument(
+        "--no-frontmatter",
+        action="store_true",
+        help="suppress YAML frontmatter on the markdown output",
+    )
+    rs.add_argument(
+        "--enforce-since",
+        action="store_true",
+        help="after fetching, drop results whose extracted published date "
+        "is before --since (requires --since). Pages without an extractable "
+        "date are kept.",
+    )
     _add_filter_args(rs)
     _add_body_args(rs)
+    _add_rerank_args(rs)
     _add_proxy_arg(rs)
     _add_cache_args(rs)
     # Research defaults: favor clean sources out of the box
@@ -875,6 +1091,21 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("selftest", help="Run a smoke test of search and fetch parsers")
     _add_proxy_arg(st)
     st.set_defaults(func=cmd_selftest)
+
+    # doctor
+    dr = sub.add_parser("doctor", help="Diagnose install / PATH / proxy / tool availability")
+    dr.add_argument("--json", action="store_true", help="emit JSON instead of human-readable text")
+    _add_proxy_arg(dr)
+    dr.set_defaults(func=cmd_doctor)
+
+    # reputation
+    rp = sub.add_parser("reputation", help="Inspect the reputation filter (explain a URL, list allowlists)")
+    rp_sub = rp.add_subparsers(dest="action", required=True)
+    rp_ex = rp_sub.add_parser("explain", help="explain why a URL is kept/dropped/boosted")
+    rp_ex.add_argument("url")
+    rp_ls = rp_sub.add_parser("list", help="list trusted allowlists")
+    rp_ls.add_argument("--category", default=None, choices=list(reputation.TRUSTED.keys()))
+    rp.set_defaults(func=cmd_reputation)
 
     return p
 

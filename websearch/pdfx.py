@@ -31,6 +31,82 @@ def looks_like_pdf(content_type: str, body_bytes: Optional[bytes] = None, url: s
     return False
 
 
+import re as _re
+
+
+_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "abstract": ("abstract", "summary"),
+    "introduction": ("introduction", "background"),
+    "methods": ("methods", "methodology", "materials and methods", "methods and materials"),
+    "results": ("results", "findings"),
+    "discussion": ("discussion",),
+    "conclusion": ("conclusion", "conclusions", "concluding remarks"),
+    "references": ("references", "bibliography", "works cited"),
+}
+
+# A line that looks like a section heading: short, mostly alphabetic, may
+# be numbered ("1.", "1.", "I.", "II.") or plain.
+_HEADING_LINE_RE = _re.compile(
+    r"^\s*(?:(?:\d+\.\d*|[IVXLC]+\.)\s+)?([A-Z][A-Za-z &/\-]{2,60})\s*$",
+)
+
+
+def _normalize_aliases(sections: list[str]) -> set[str]:
+    wanted: set[str] = set()
+    for s in sections:
+        key = s.strip().lower()
+        if not key:
+            continue
+        if key in _SECTION_ALIASES:
+            wanted.update(_SECTION_ALIASES[key])
+        else:
+            wanted.add(key)
+    return wanted
+
+
+def extract_sections(text: str, sections: list[str]) -> str:
+    """From plaintext (typically pdftotext output), keep only named sections.
+
+    Heading detection is intentionally generous: a line is a heading if it's
+    short, starts capitalized, and matches a known section name (or alias).
+    Returns the original text if no headings are detected at all.
+    """
+    if not sections or not text:
+        return text
+    wanted = _normalize_aliases(sections)
+    if not wanted:
+        return text
+
+    lines = text.splitlines()
+    heading_idx: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or len(stripped) > 80:
+            continue
+        m = _HEADING_LINE_RE.match(line)
+        if not m:
+            continue
+        title = m.group(1).strip().lower()
+        if title in wanted or any(title == w or title.startswith(w) for w in wanted):
+            heading_idx.append((i, title))
+        else:
+            # Track any heading-shaped line so we know where the wanted one ends
+            heading_idx.append((i, "__other__"))
+
+    if not heading_idx or all(t == "__other__" for _, t in heading_idx):
+        return text  # no recognizable structure — return whole document
+
+    parts: list[str] = []
+    for pos, (i, title) in enumerate(heading_idx):
+        if title == "__other__":
+            continue
+        end = heading_idx[pos + 1][0] if pos + 1 < len(heading_idx) else len(lines)
+        chunk = "\n".join(lines[i:end]).strip()
+        if chunk:
+            parts.append(chunk)
+    return "\n\n".join(parts) if parts else text
+
+
 def extract(body: bytes, max_pages: Optional[int] = None) -> str:
     """Extract text from a PDF byte stream.
 

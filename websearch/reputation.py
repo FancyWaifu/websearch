@@ -167,6 +167,48 @@ def score(url: str) -> int:
     return s
 
 
+def explain(url: str) -> dict:
+    """Human-readable trace of why a URL would be kept, dropped, or boosted.
+
+    Used by `websearch reputation explain URL` to debug "where did my source go?"
+    """
+    host = domain_of(url)
+    reasons: list[str] = []
+    if not host:
+        return {"url": url, "host": "", "score": 0, "reasons": ["unparseable URL"]}
+    blocked = host in BLOCKLIST or any(host.endswith("." + b) for b in BLOCKLIST)
+    if blocked:
+        reasons.append(f"BLOCKLISTED ({host}): score -10 → dropped at trust=medium and above")
+    cat = category_of(host)
+    if cat:
+        reasons.append(f"trusted/{cat} allowlist match: +3")
+    if any(host.endswith(tld) for tld in TRUSTED_TLD_SUFFIXES):
+        reasons.append("trusted TLD: +2")
+    for pat in SEO_SPAM_URL_PATTERNS:
+        if pat.search(url):
+            reasons.append(f"SEO-spam URL pattern '{pat.pattern}': -2")
+            break
+    s = score(url)
+    if not reasons:
+        reasons.append("no signals — neutral score 0 (kept at trust=any, dropped at trust=high)")
+    return {
+        "url": url,
+        "host": host,
+        "category": cat,
+        "score": s,
+        "kept_at_trust_medium": s > -5,
+        "kept_at_trust_high": s >= 2,
+        "reasons": reasons,
+    }
+
+
+def list_category(category: Optional[str] = None) -> dict:
+    """Return the allowlist contents. category=None returns all."""
+    if category:
+        return {category: sorted(TRUSTED.get(category, set()))}
+    return {cat: sorted(domains) for cat, domains in TRUSTED.items()}
+
+
 def filter_and_rank(
     results: list,
     trust: str = "any",

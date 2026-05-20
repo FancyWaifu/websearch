@@ -29,6 +29,8 @@ try:
     from . import doctor as _doctor
     from . import dates as _dates
     from . import pdfx as _pdfx
+    from . import usernames as _usernames
+    from . import gh as _gh
 except ImportError as _imp_err:
     sys.stderr.write(
         "websearch: failed to import its own package.\n"
@@ -603,6 +605,25 @@ def cmd_research(args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_jq(text: str, expr: str) -> str:
+    """Pipe text through system `jq -r EXPR`. Errors print to stderr; on
+    failure we return the original text so the user can see what was wrong."""
+    import shutil as _shutil
+    import subprocess as _sp
+    if not _shutil.which("jq"):
+        print("warning: --jq specified but `jq` is not on PATH; ignoring", file=sys.stderr)
+        return text
+    try:
+        r = _sp.run(["jq", "-r", expr], input=text, capture_output=True, text=True, timeout=20)
+    except _sp.TimeoutExpired:
+        print("warning: jq timed out after 20s; returning raw body", file=sys.stderr)
+        return text
+    if r.returncode != 0:
+        print(f"warning: jq returned rc={r.returncode}: {r.stderr.strip()[:200]}", file=sys.stderr)
+        return text
+    return r.stdout
+
+
 def cmd_fetch(args: argparse.Namespace) -> int:
     proxy = args.proxy
     cache = _resolve_cache(args)
@@ -629,10 +650,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
         if args.json:
             body = _postprocess_body(result.text, result.content_type, **bkwargs)
+            if getattr(args, "jq", None):
+                body = _apply_jq(body, args.jq)
             out = result.to_dict()
             out["body"] = body
             out.pop("text", None)
             print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 0 if result.error is None else 1
+
+        # When --jq is set, treat the body as JSON and emit the filter output directly
+        if getattr(args, "jq", None) and result.text:
+            print(_apply_jq(result.text, args.jq), end="" if "\n" in _apply_jq(result.text, args.jq) else "\n")
             return 0 if result.error is None else 1
 
         return _print_fetch_text(
@@ -816,6 +844,78 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_github(args: argparse.Namespace) -> int:
+    """GitHub user reconnaissance — compact summaries from the public API."""
+    cache = _resolve_cache(args)
+    kw = dict(timeout=args.timeout, proxy=args.proxy, cache=cache, refresh=args.refresh)
+    action = args.action
+    user = args.username
+
+    if action == "user":
+        result = _gh.user_summary(user, **kw)
+    elif action == "repos":
+        result = _gh.repos(user, **kw)
+    elif action == "emails":
+        result = _gh.emails(user, parallel=args.parallel, **kw)
+    elif action == "events":
+        result = _gh.events(user, **kw)
+    elif action == "gists":
+        result = _gh.gists(user, **kw)
+    elif action == "starred":
+        result = _gh.starred(user, limit=args.limit, **kw)
+    elif action == "orgs":
+        result = _gh.orgs(user, **kw)
+    elif action == "full":
+        result = _gh.full_report(user, **kw)
+    else:
+        print(f"unknown action: {action}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_username(args: argparse.Namespace) -> int:
+    """Probe a curated list of platforms for an account with `username`."""
+    from typing import Optional
+    sites: Optional[list[str]] = None
+    if args.sites:
+        sites = []
+        for s in args.sites:
+            sites.extend([t.strip() for t in s.split(",") if t.strip()])
+    try:
+        results = _usernames.enumerate_username(
+            args.username,
+            sites=sites,
+            timeout=args.timeout,
+            proxy=args.proxy,
+            cache=_resolve_cache(args),
+            parallel=args.parallel,
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps([r.to_dict() for r in results], indent=2))
+        return 0
+
+    # Human-readable: hits first, then misses
+    hits = [r for r in results if r.found]
+    misses = [r for r in results if not r.found]
+    print(f"# username: {args.username}  ({len(hits)} hits / {len(results)} probed)")
+    if hits:
+        print("\nFOUND:")
+        for r in hits:
+            print(f"  {r.site:18s} {r.url}")
+    if misses and args.verbose:
+        print("\nNot found:")
+        for r in misses:
+            print(f"  {r.site:18s} {r.note:40s} {r.url}")
+    elif misses:
+        print(f"\n({len(misses)} sites had no account — use --verbose to see them)")
+    return 0
+
+
 def cmd_reputation(args: argparse.Namespace) -> int:
     if args.action == "explain":
         result = reputation.explain(args.url)
@@ -963,6 +1063,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="for batch fetches, emit one clean markdown document instead of separator-divided text",
     )
+    f.add_argument(
+        "--jq",
+        default=None,
+        metavar="EXPR",
+        help="pipe the fetched body through system `jq -r EXPR` "
+        "(requires `jq` on PATH). Useful for trimming JSON API responses.",
+    )
     _add_body_args(f)
     _add_proxy_arg(f)
     _add_cache_args(f)
@@ -1097,6 +1204,38 @@ def build_parser() -> argparse.ArgumentParser:
     dr.add_argument("--json", action="store_true", help="emit JSON instead of human-readable text")
     _add_proxy_arg(dr)
     dr.set_defaults(func=cmd_doctor)
+
+    # github
+    gh = sub.add_parser("github", help="GitHub user reconnaissance (user/repos/emails/events/full)")
+    gh.add_argument(
+        "action",
+        choices=["user", "repos", "emails", "events", "gists", "starred", "orgs", "full"],
+    )
+    gh.add_argument("username")
+    gh.add_argument("--timeout", type=int, default=15)
+    gh.add_argument("--parallel", type=int, default=6, help="parallel workers for `emails` action")
+    gh.add_argument("--limit", type=int, default=30, help="max items for `starred` action")
+    _add_proxy_arg(gh)
+    _add_cache_args(gh)
+    gh.set_defaults(func=cmd_github)
+
+    # username
+    un = sub.add_parser("username", help="Probe common platforms for accounts matching a username")
+    un.add_argument("username", help="username to look up")
+    un.add_argument(
+        "--sites",
+        action="append",
+        default=[],
+        metavar="LIST",
+        help="comma-separated subset of probe names (repeatable). Default: all.",
+    )
+    un.add_argument("--timeout", type=int, default=15)
+    un.add_argument("--parallel", type=int, default=8)
+    un.add_argument("--json", action="store_true", help="emit JSON instead of human-readable output")
+    un.add_argument("-v", "--verbose", action="store_true", help="also list sites where the user wasn't found")
+    _add_proxy_arg(un)
+    _add_cache_args(un)
+    un.set_defaults(func=cmd_username)
 
     # reputation
     rp = sub.add_parser("reputation", help="Inspect the reputation filter (explain a URL, list allowlists)")

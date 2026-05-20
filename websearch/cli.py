@@ -29,6 +29,7 @@ try:
     from . import doctor as _doctor
     from . import dates as _dates
     from . import pdfx as _pdfx
+    from . import openalex as _openalex
 except ImportError as _imp_err:
     sys.stderr.write(
         "websearch: failed to import its own package.\n"
@@ -816,6 +817,104 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_papers(args: argparse.Namespace) -> int:
+    """Search OpenAlex for academic papers."""
+    from pathlib import Path
+
+    mailto = _openalex.resolve_mailto(args.mailto)
+    cache = _resolve_cache(args)
+
+    if args.count_only:
+        n = _openalex.preview_search(
+            args.query,
+            mailto=mailto,
+            year_min=args.year_min, year_max=args.year_max,
+            min_citations=args.min_citations,
+            oa_only=args.oa_only, field=args.field,
+            cache=cache, max_age=args.max_age, refresh=args.refresh,
+            proxy=args.proxy,
+        )
+        print(json.dumps({"query": args.query, "count": n}))
+        return 0
+
+    def _progress(page: int, have: int, want: int) -> None:
+        sys.stderr.write(f"\r  page {page}, {have}/{want} articles...")
+        sys.stderr.flush()
+
+    articles, total = _openalex.fetch_articles(
+        args.query,
+        max_results=args.max,
+        mailto=mailto,
+        year_min=args.year_min, year_max=args.year_max,
+        min_citations=args.min_citations,
+        oa_only=args.oa_only, field=args.field,
+        sort_by=args.sort,
+        cache=cache, max_age=args.max_age, refresh=args.refresh,
+        proxy=args.proxy,
+        progress=None if args.format == "json" else _progress,
+    )
+    if args.format != "json":
+        sys.stderr.write("\r" + " " * 60 + "\r")
+
+    if not articles:
+        print(f"No articles found for: {args.query!r}", file=sys.stderr)
+        return 1
+
+    # Optional: download OA PDFs
+    pdf_paths: dict[str, str] = {}
+    if args.download_pdfs:
+        out_dir = Path(args.pdf_dir).expanduser()
+        for art in articles:
+            p = _openalex.download_pdf(art, out_dir, proxy=args.proxy)
+            if p:
+                pdf_paths[art.openalex_id] = str(p)
+        sys.stderr.write(f"# downloaded {len(pdf_paths)} PDFs to {out_dir}\n")
+
+    # Optional: fetch related articles per result
+    related_map: dict[str, list[dict]] = {}
+    if args.related:
+        for art in articles:
+            related_map[art.openalex_id] = _openalex.fetch_related_articles(
+                art.openalex_id, limit=args.related, mailto=mailto,
+                cache=cache, max_age=args.max_age, refresh=args.refresh,
+                proxy=args.proxy,
+            )
+
+    # Render
+    fmt = args.format
+    if fmt == "json":
+        out = {
+            "query": args.query,
+            "total_match_count": total,
+            "returned": len(articles),
+            "articles": [a.to_dict() for a in articles],
+        }
+        if args.citation_graph:
+            out["citation_network"] = _openalex.citation_network(articles)
+        if related_map:
+            out["related"] = related_map
+        if pdf_paths:
+            out["pdfs"] = pdf_paths
+        print(json.dumps(out, indent=2, default=str))
+    elif fmt == "md":
+        print(_openalex.to_markdown(args.query, articles))
+        if args.citation_graph:
+            print("\n## Citation network (internal edges)\n")
+            print(json.dumps(_openalex.citation_network(articles), indent=2))
+    elif fmt == "bibtex":
+        print(_openalex.to_bibtex(articles))
+    elif fmt == "csv":
+        sys.stdout.write(_openalex.to_csv(articles))
+    elif fmt == "ris":
+        print(_openalex.to_ris(articles))
+    else:
+        print(f"unknown format: {fmt}", file=sys.stderr)
+        return 2
+
+    sys.stderr.write(f"# matched {total} works, returned {len(articles)}\n")
+    return 0
+
+
 def cmd_reputation(args: argparse.Namespace) -> int:
     if args.action == "explain":
         result = reputation.explain(args.url)
@@ -1097,6 +1196,48 @@ def build_parser() -> argparse.ArgumentParser:
     dr.add_argument("--json", action="store_true", help="emit JSON instead of human-readable text")
     _add_proxy_arg(dr)
     dr.set_defaults(func=cmd_doctor)
+
+    # papers — academic paper search via OpenAlex
+    pp = sub.add_parser(
+        "papers",
+        help="Search OpenAlex for academic papers (with filters and export formats)",
+    )
+    pp.add_argument("query", help="search query (e.g., 'CRISPR gene editing')")
+    pp.add_argument("-n", "--max", type=int, default=25,
+                    help="max articles to return (default: 25)")
+    pp.add_argument("--year-min", type=int, default=None, metavar="YYYY")
+    pp.add_argument("--year-max", type=int, default=None, metavar="YYYY")
+    pp.add_argument("--min-citations", type=int, default=None,
+                    help="drop works with fewer than this many citations")
+    pp.add_argument("--oa-only", action="store_true",
+                    help="restrict to open-access works")
+    pp.add_argument("--field", default=None, metavar="FIELD",
+                    help="restrict by topic field (e.g., 'Medicine', 'Computer Science')")
+    pp.add_argument("--sort", choices=["citations", "newest", "oldest"], default=None,
+                    help="sort order (default: OpenAlex relevance)")
+    pp.add_argument("--format", choices=["md", "json", "bibtex", "csv", "ris"],
+                    default="md",
+                    help="output format (default: md)")
+    pp.add_argument("--count-only", action="store_true",
+                    help="print only the total match count, do not fetch articles")
+    pp.add_argument("--related", type=int, default=0, metavar="N",
+                    help="also fetch N related works per article (json/md only)")
+    pp.add_argument("--citation-graph", action="store_true",
+                    help="include internal citation network (json/md only)")
+    pp.add_argument("--download-pdfs", action="store_true",
+                    help="download OA PDFs to --pdf-dir")
+    pp.add_argument("--pdf-dir", default="./pdfs",
+                    help="directory to save PDFs (default: ./pdfs)")
+    pp.add_argument(
+        "--mailto",
+        default=None,
+        metavar="EMAIL",
+        help="contact email for the OpenAlex polite pool (higher rate "
+        "limits). Falls back to $OPENALEX_API_KEY.",
+    )
+    _add_proxy_arg(pp)
+    _add_cache_args(pp)
+    pp.set_defaults(func=cmd_papers)
 
     # reputation
     rp = sub.add_parser("reputation", help="Inspect the reputation filter (explain a URL, list allowlists)")

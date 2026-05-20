@@ -33,6 +33,7 @@ search    Search the web (DDG, Bing, or auto-fallback)
 fetch     Fetch one or more URLs with smart Wayback fallback
 text      Shortcut: fetch + extract clean text
 research  Multi-query search + fetch top + compact markdown
+papers    Search OpenAlex for academic papers (filters + BibTeX/CSV/RIS export)
 cite      Generate a markdown citation block from URLs
 download  Stream a URL to disk (binary-safe, with progress)
 cache     Manage the disk cache (stats / clear)
@@ -92,6 +93,25 @@ websearch search -q "term" --fetch-top 5 --grep "regex" --grep-context 2 --compa
 ### `research`
 Defaults: `--trust medium`, `--max-chars 2500`, compact markdown always on. Multi-query → dedupe → fetch top N → one document.
 
+### `papers`
+Searches the [OpenAlex](https://openalex.org) corpus (~250M scholarly works). No API key required; set `OPENALEX_API_KEY=you@example.com` (or pass `--mailto`) to land in the polite-pool rate tier.
+
+```bash
+# Top-cited mRNA vaccine papers since 2020, as BibTeX
+websearch papers "mRNA vaccines" --year-min 2020 --sort citations -n 20 --format bibtex
+
+# OA papers only, with internal citation graph, as JSON
+websearch papers "diffusion models" --oa-only --citation-graph --format json
+
+# Just the match count for a query, no article fetch
+websearch papers "long covid" --count-only --year-min 2023
+
+# Pull related works for each hit + download OA PDFs
+websearch papers "AlphaFold protein structure" -n 10 --related 5 --download-pdfs
+```
+
+Flags: `--year-min/--year-max`, `--min-citations`, `--oa-only`, `--field`, `--sort {citations,newest,oldest}`, `--format {md,json,bibtex,csv,ris}`, `--related N`, `--citation-graph`, `--download-pdfs --pdf-dir DIR`, `--count-only`, `--mailto`.
+
 ## Caching
 
 SQLite WAL cache at `~/.cache/websearch/cache.db`, thread-safe. `websearch cache stats` and `websearch cache clear` to manage.
@@ -107,6 +127,7 @@ websearch/
 ├── cli.py          # argparse, subcommand dispatch
 ├── core.py         # search/fetch engines, Wayback fallback
 ├── cache.py        # SQLite WAL cache
+├── openalex.py     # OpenAlex paper search + BibTeX/CSV/RIS export
 ├── pdfx.py         # PDF detection + pdftotext extraction
 ├── reputation.py   # blocklist, trusted allowlists, TLD trust heuristics
 └── __init__.py

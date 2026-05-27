@@ -622,7 +622,14 @@ def fetch_many(
     with `(idx, total, result)` where idx is the input position. Fires
     in completion order (not input order) so callers can stream UI
     updates as fetches finish."""
-    fns = {"smart": fetch_smart, "direct": fetch_direct, "wayback": fetch_wayback}
+    fns: dict = {
+        "smart": fetch_smart, "direct": fetch_direct, "wayback": fetch_wayback,
+    }
+    # Lazy-import browser to avoid pulling camoufox into every websearch
+    # invocation. Users who don't use --via browser never see the import.
+    if via == "browser":
+        from .browser import fetch_browser
+        fns["browser"] = fetch_browser
     fn = fns.get(via, fetch_smart)
     urls = list(urls)
     total = len(urls)

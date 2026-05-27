@@ -884,6 +884,10 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             result = fetch_direct(url, use_whisper=use_whisper, **kwargs)
         elif args.via == "wayback":
             result = fetch_wayback(url, **kwargs)
+        elif args.via == "browser":
+            from .browser import fetch_browser
+            # fetch_browser doesn't take use_whisper (HTML-only), so drop it
+            result = fetch_browser(url, **kwargs)
         else:
             result = fetch_smart(url, use_whisper=use_whisper, **kwargs)
 
@@ -1382,9 +1386,12 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("urls", nargs="+", help="one or more URLs")
     f.add_argument(
         "--via",
-        choices=["smart", "direct", "wayback"],
+        choices=["smart", "direct", "wayback", "browser"],
         default="smart",
-        help="fetch method (default: smart)",
+        help="fetch method (default: smart). 'browser' uses headless "
+        "camoufox to render JS-heavy / anti-bot pages — needs the "
+        "[browser] extra (`pipx inject websearch camoufox`) and is "
+        "200MB + 2-10s per call.",
     )
     f.add_argument("--raw", action="store_true", help="emit raw HTML instead of extracted text")
     f.add_argument("--json", action="store_true", help="emit JSON envelope")

@@ -43,6 +43,14 @@ def _have_sentence_transformers() -> bool:
         return False
 
 
+def _have_camoufox() -> bool:
+    try:
+        import camoufox  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _yt_dlp_info() -> dict:
     """yt-dlp availability + version + age in one place."""
     path = shutil.which("yt-dlp")
@@ -352,6 +360,9 @@ def report(proxy: Optional[str] = None) -> dict:
             "model": os.environ.get("WEBSEARCH_EMBED_MODEL",
                                     "sentence-transformers/all-MiniLM-L6-v2"),
         },
+        "camoufox": {
+            "available": _have_camoufox(),
+        },
         "yt_cookies_from": os.environ.get("WEBSEARCH_YT_COOKIES_FROM", ""),
     }
     try:
@@ -483,6 +494,11 @@ def format_human(rep: dict) -> str:
         tools.append(f"  embed      : ok  (sentence-transformers, model={st.get('model')})")
     else:
         tools.append("  embed      : missing (pipx inject websearch sentence-transformers) — needed for --rerank-vector; falls back to TF-IDF when missing")
+    cf = rep.get("camoufox", {})
+    if cf.get("available"):
+        tools.append("  browser    : ok  (camoufox available for --via browser on JS-heavy / anti-bot sites)")
+    else:
+        tools.append("  browser    : missing (pipx inject websearch camoufox && camoufox fetch) — needed for --via browser")
     lines.append("")
     lines.append("External tools:")
     lines.extend(tools)

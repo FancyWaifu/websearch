@@ -247,7 +247,16 @@ def _make_stream_progress(args: argparse.Namespace):
 
     def progress(idx: int, total: int, fr) -> None:
         elapsed = int((time.time() - start) * 1000)
-        status = "ok" if (fr.error is None and (fr.text or "").strip()) else f"FAIL: {fr.error or 'empty'}"
+        # Run the same usable-check the backfill loop uses, so the stream
+        # status agrees with what ends up in the final report. The check
+        # caches its result on the FetchResult, so calling it again in
+        # _fetch_top_with_backfill costs nothing.
+        if _is_usable_fetch(fr):
+            status = "ok"
+        elif fr.error:
+            status = f"FAIL: {fr.error[:60]}"
+        else:
+            status = "EMPTY (extraction yielded nothing — login wall or SPA)"
         # Title is unknown at fetch time (it comes from the search snippet,
         # not the body), so just show URL + status.
         print(f"  [{idx + 1}/{total}] {fr.url}  [{status}, {elapsed}ms]",
@@ -481,8 +490,86 @@ def _attach_fetched(container: dict, fetched: list, args: argparse.Namespace) ->
             looks_html = "html" in (fr.content_type or "").lower() or body.lstrip().startswith("<")
             pub = _dates.extract_published(body) if looks_html else None
             d["published_date"] = pub.isoformat() if pub else None
-        d["body"] = _postprocess_body(body, fr.content_type, **kw)
+        # _is_usable_fetch cached the extracted body during backfill — reuse
+        # it when present to avoid running trafilatura twice on the same
+        # HTML. Falls back to full _postprocess_body when no cache (e.g.
+        # the fetched list came from elsewhere or extraction was skipped).
+        cached = getattr(fr, "_extracted_text", None)
+        if cached is not None and not _body_kwargs_need_full_pipeline(kw):
+            d["body"] = _truncate_only(cached, kw)
+        else:
+            d["body"] = _postprocess_body(body, fr.content_type, **kw)
         container["fetched"].append(d)
+
+
+def _body_kwargs_need_full_pipeline(kw: dict) -> bool:
+    """The cached _extracted_text is from html_to_text(mode='article'). When
+    the caller asked for tables/raw mode, sections, grep, or skip_chars,
+    the cache isn't enough — fall back to the full _postprocess_body."""
+    if kw.get("mode") not in (None, "article"):
+        return True
+    if kw.get("sections") or kw.get("grep") or kw.get("skip_chars"):
+        return True
+    return False
+
+
+def _truncate_only(text: str, kw: dict) -> str:
+    """Trim cached extracted text per the user's --max-chars budget."""
+    from .core import smart_truncate
+    return smart_truncate(text, kw.get("max_chars"))
+
+
+_USABLE_MIN_CHARS = 200
+
+
+def _is_usable_fetch(fr, min_chars: int = _USABLE_MIN_CHARS) -> bool:
+    """A fetch is usable iff extraction yields meaningfully non-empty text.
+
+    The old check looked only at raw response text (`fr.text.strip()`),
+    which passed Reddit / Facebook / login walls / SPA shells — pages
+    that return ~50KB of HTML chrome with zero readable content. Those
+    look "ok" to the fetcher but extract to ~nothing via trafilatura,
+    leaving the research output with empty slots. Run a quick
+    extraction probe here so backfill swaps them out for usable
+    sources.
+
+    Caches the extracted text on the FetchResult as `_extracted_text`
+    so `_attach_fetched` can reuse it without re-running trafilatura.
+    Idempotent: calls after the first reuse the cached value.
+    """
+    if fr.error is not None:
+        return False
+    # Cached from a prior _is_usable_fetch call (e.g. stream callback then
+    # backfill check) — reuse to avoid double-extracting.
+    cached = getattr(fr, "_extracted_text", None)
+    if cached is not None:
+        return len(cached) >= min_chars
+    raw = (fr.text or "").strip()
+    if not raw:
+        return False
+    # PDFs and transcripts are already plaintext — no further extraction.
+    if fr.is_pdf or (fr.content_type and "transcript" in fr.content_type):
+        try:
+            fr._extracted_text = raw  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return len(raw) >= min_chars
+    # HTML: probe with the article extractor. If extraction itself fails,
+    # don't lose the result — better to keep a 50/50 source than drop it.
+    try:
+        from .core import html_to_text
+        extracted = html_to_text(raw, max_chars=None, mode="article")
+    except Exception:
+        return True
+    extracted_stripped = (extracted or "").strip()
+    # Stash the extracted text so _attach_fetched doesn't redo the work.
+    # FetchResult is a dataclass — adding an attribute via __dict__ is
+    # fine since dataclasses still carry instance dicts unless slotted.
+    try:
+        fr._extracted_text = extracted_stripped  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+    return len(extracted_stripped) >= min_chars
 
 
 def _fetch_top_with_backfill(
@@ -491,11 +578,12 @@ def _fetch_top_with_backfill(
     """Fetch `depth` usable bodies from the ranked `pool` of result dicts.
 
     When a top result fails to fetch (dead link, no Wayback snapshot, block
-    page), the next-ranked candidate is pulled in to replace it — so the
-    caller gets `depth` real sources whenever the pool runs deep enough,
-    instead of burning a slot on an error. If the pool is exhausted before
-    `depth` successes, the unrecoverable failures are kept in the returned
-    list so the failure stays visible rather than silently hidden.
+    page, or an empty-after-extraction page like a Reddit login wall),
+    the next-ranked candidate is pulled in to replace it — so the caller
+    gets `depth` real sources whenever the pool runs deep enough. If the
+    pool is exhausted before `depth` successes, the unrecoverable
+    failures are kept in the returned list so the failure stays visible
+    rather than silently hidden.
 
     Returns (fetched_results, n_backfilled).
     """
@@ -509,9 +597,15 @@ def _fetch_top_with_backfill(
         batch = urls[idx : idx + need]
         idx += len(batch)
         for fr in fetch_many(batch, **fetch_kwargs):
-            if fr.error is None and (fr.text or "").strip():
+            if _is_usable_fetch(fr):
                 good.append(fr)
             else:
+                # Mark empty-extraction failures so the renderer can show
+                # a more informative reason than just "fetch failed."
+                if fr.error is None:
+                    fr.error = ("empty after extraction — likely login wall, "
+                                "JS-rendered SPA, or anti-bot challenge; try "
+                                "--via browser")
                 failed.append(fr)
     fetched = good[:depth]
     if len(fetched) < depth:

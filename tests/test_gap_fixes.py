@@ -180,6 +180,100 @@ def test_demote_missing_terms_preserves_order_within_buckets():
     assert [r["url"] for r in out] == ["a", "c", "b", "d"]
 
 
+# ---------- Auto-backfill on empty extraction ----------
+
+def test_is_usable_fetch_rejects_empty_extraction(monkeypatch):
+    """A 200-OK page that extracts to ~nothing (login wall, SPA shell)
+    should be marked unusable so backfill kicks in."""
+    from websearch.cli import _is_usable_fetch
+    from websearch.core import FetchResult
+
+    # Reddit-style: lots of raw HTML chrome, no real article content.
+    fr = FetchResult(
+        url="https://reddit.com/r/Games/comments/x",
+        final_url="https://reddit.com/r/Games/comments/x",
+        status=200,
+        content_type="text/html",
+        text="<html><body><nav>nav</nav></body></html>" * 50,
+        via="direct",
+    )
+    # html_to_text on this should yield ~nothing
+    assert _is_usable_fetch(fr, min_chars=200) is False
+
+
+def test_is_usable_fetch_accepts_real_article():
+    from websearch.cli import _is_usable_fetch
+    from websearch.core import FetchResult
+    article = (
+        "<html><body><article>"
+        + "<p>" + ("This is a real article paragraph with substantive content. " * 20) + "</p>"
+        + "</article></body></html>"
+    )
+    fr = FetchResult(
+        url="https://example.com/article",
+        final_url="https://example.com/article",
+        status=200,
+        content_type="text/html",
+        text=article,
+        via="direct",
+    )
+    assert _is_usable_fetch(fr, min_chars=200) is True
+    # Should have cached the extracted text on the FetchResult.
+    assert getattr(fr, "_extracted_text", None) is not None
+    assert len(fr._extracted_text) >= 200
+
+
+def test_is_usable_fetch_rejects_fetch_errors():
+    from websearch.cli import _is_usable_fetch
+    from websearch.core import FetchResult
+    fr = FetchResult(
+        url="x", final_url="x", status=0,
+        content_type="", text="", via="direct",
+        error="connection refused",
+    )
+    assert _is_usable_fetch(fr) is False
+
+
+def test_is_usable_fetch_treats_pdf_and_transcript_as_already_extracted():
+    """PDF text and YT transcripts are already plaintext — don't run
+    trafilatura on them, just check length."""
+    from websearch.cli import _is_usable_fetch
+    from websearch.core import FetchResult
+    pdf = FetchResult(
+        url="x.pdf", final_url="x.pdf", status=200,
+        content_type="application/pdf",
+        text="Abstract\nThis paper presents " + ("findings " * 100),
+        via="direct", is_pdf=True,
+    )
+    assert _is_usable_fetch(pdf) is True
+
+    transcript = FetchResult(
+        url="https://youtu.be/x", final_url="https://youtu.be/x", status=200,
+        content_type="text/plain; transcript",
+        text="hi everyone " * 50,
+        via="direct",
+    )
+    assert _is_usable_fetch(transcript) is True
+
+
+def test_is_usable_fetch_is_idempotent_and_caches():
+    """Calling _is_usable_fetch twice should not run trafilatura twice."""
+    from websearch.cli import _is_usable_fetch
+    from websearch.core import FetchResult
+    fr = FetchResult(
+        url="x", final_url="x", status=200,
+        content_type="text/html",
+        text="<html><body><p>" + ("real text " * 100) + "</p></body></html>",
+        via="direct",
+    )
+    assert _is_usable_fetch(fr) is True
+    first_cache = fr._extracted_text
+    # Mutate to ensure the second call uses the cache, not re-extraction
+    fr.text = "<html></html>"
+    assert _is_usable_fetch(fr) is True  # would be False if re-extracted
+    assert fr._extracted_text == first_cache
+
+
 def test_rerank_vector_degrades_to_tfidf_when_dep_missing(monkeypatch):
     """When sentence-transformers isn't installed, rerank_vector should
     transparently fall back to TF-IDF instead of crashing. The CLI also

@@ -240,16 +240,29 @@ def format_human(rep: dict) -> str:
             lines.append(f"  unresponsive: {', '.join(unresp)}")
 
     tools = []
-    for k in ("pdftotext", "yt_dlp"):
-        info = rep.get(k, {})
-        mark = "ok" if info.get("available") else "missing"
-        tools.append(f"  {k:10s} : {mark}  ({info.get('path') or '-'})")
+    info = rep.get("pdftotext", {})
+    mark = "ok" if info.get("available") else "missing"
+    tools.append(f"  pdftotext  : {mark}  ({info.get('path') or '-'})")
+
+    # yt_dlp itself works fine, but YouTube has bot-checked the anonymous
+    # path since early 2026 — without cookies, transcript fetches fail with
+    # "Sign in to confirm you're not a bot". Mark accordingly so `doctor`
+    # doesn't lull the user into thinking YT transcripts will Just Work.
+    yt_info = rep.get("yt_dlp", {})
     yt_api = rep.get("youtube_transcript_api", {})
+    yt_cookies = rep.get("yt_cookies_from") or ""
+    if not yt_info.get("available"):
+        yt_mark = "missing"
+    elif yt_cookies:
+        yt_mark = f"ok  (YT cookies: {yt_cookies})"
+    elif yt_api.get("available"):
+        yt_mark = "ok  (YT transcripts route via yt_api; yt_dlp fallback bot-checked without $WEBSEARCH_YT_COOKIES_FROM)"
+    else:
+        yt_mark = "ok* (YT transcripts BROKEN without $WEBSEARCH_YT_COOKIES_FROM=safari|chrome|firefox|edge or yt_api)"
+    tools.append(f"  yt_dlp     : {yt_mark}  ({yt_info.get('path') or '-'})")
+
     yt_api_mark = "ok" if yt_api.get("available") else "missing (pipx inject websearch youtube-transcript-api)"
     tools.append(f"  yt_api     : {yt_api_mark}")
-    yt_cookies = rep.get("yt_cookies_from") or ""
-    if yt_cookies:
-        tools.append(f"  yt_cookies : $WEBSEARCH_YT_COOKIES_FROM={yt_cookies}")
     lines.append("")
     lines.append("External tools:")
     lines.extend(tools)

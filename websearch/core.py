@@ -392,6 +392,7 @@ def fetch_direct(
     max_age: Optional[float] = None,
     refresh: bool = False,
     verify: bool = True,
+    use_whisper: bool = False,
 ) -> FetchResult:
     """Fetch a URL directly. Honors cache if provided and `refresh=False`.
 
@@ -420,7 +421,9 @@ def fetch_direct(
     # YouTube short-circuit: HTML body for YouTube is useless. Pull transcript
     # via yt-dlp and return that as `text` so downstream extraction/grep works.
     if _transcripts.is_youtube_url(url):
-        body, err = _transcripts.fetch_transcript(url, timeout=timeout)
+        body, err = _transcripts.fetch_transcript(
+            url, timeout=timeout, use_whisper=use_whisper
+        )
         if body:
             res = FetchResult(
                 url=url, final_url=url, status=200,
@@ -547,6 +550,7 @@ def fetch_smart(
     max_age: Optional[float] = None,
     refresh: bool = False,
     verify: bool = True,
+    use_whisper: bool = False,
 ) -> FetchResult:
     """Try direct first; on 4xx/5xx or network error, fall back to Wayback.
 
@@ -556,7 +560,7 @@ def fetch_smart(
     """
     direct = fetch_direct(
         url, timeout=timeout, proxy=proxy, cache=cache, max_age=max_age,
-        refresh=refresh, verify=verify,
+        refresh=refresh, verify=verify, use_whisper=use_whisper,
     )
     if direct.status and direct.status < 400 and direct.text:
         return direct
@@ -589,12 +593,16 @@ def fetch_many(
     max_age: Optional[float] = None,
     refresh: bool = False,
     verify: bool = True,
+    use_whisper: bool = False,
 ) -> list[FetchResult]:
     """Fetch many URLs concurrently. Preserves input order in the result."""
     fns = {"smart": fetch_smart, "direct": fetch_direct, "wayback": fetch_wayback}
     fn = fns.get(via, fetch_smart)
     urls = list(urls)
     results: list[Optional[FetchResult]] = [None] * len(urls)
+    # Wayback doesn't take use_whisper, so only forward it to the YouTube-
+    # capable callers. Direct/smart paths fall through to fetch_transcript.
+    extra: dict = {"use_whisper": use_whisper} if fn is not fetch_wayback else {}
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
         futures = {
             ex.submit(
@@ -606,6 +614,7 @@ def fetch_many(
                 max_age=max_age,
                 refresh=refresh,
                 verify=verify,
+                **extra,
             ): i
             for i, url in enumerate(urls)
         }

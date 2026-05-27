@@ -24,6 +24,14 @@ def _have_yt_api() -> bool:
         return False
 
 
+def _have_faster_whisper() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _path_entries() -> list[str]:
     return [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
 
@@ -180,6 +188,10 @@ def report(proxy: Optional[str] = None) -> dict:
         "youtube_transcript_api": {
             "available": _have_yt_api(),
         },
+        "faster_whisper": {
+            "available": _have_faster_whisper(),
+            "model": os.environ.get("WEBSEARCH_WHISPER_MODEL", "small"),
+        },
         "yt_cookies_from": os.environ.get("WEBSEARCH_YT_COOKIES_FROM", ""),
     }
     try:
@@ -263,6 +275,11 @@ def format_human(rep: dict) -> str:
 
     yt_api_mark = "ok" if yt_api.get("available") else "missing (pipx inject websearch youtube-transcript-api)"
     tools.append(f"  yt_api     : {yt_api_mark}")
+    fw = rep.get("faster_whisper", {})
+    if fw.get("available"):
+        tools.append(f"  whisper    : ok  (faster-whisper, model={fw.get('model','small')})")
+    else:
+        tools.append("  whisper    : missing (pipx inject websearch faster-whisper) — needed for --whisper on captionless YT")
     lines.append("")
     lines.append("External tools:")
     lines.extend(tools)

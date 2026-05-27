@@ -1,8 +1,8 @@
-"""YouTube transcript fetch.
+"""YouTube transcript + metadata + (optional) Whisper fallback.
 
 The built-in HTML fetcher returns ~zero usable text for a YouTube page —
 the transcript is loaded as captions, not as readable body content. This
-module detects YouTube URLs and pulls captions through a two-tier path:
+module detects YouTube URLs and pulls captions through a tiered path:
 
 1. `youtube-transcript-api` (optional pip dep) — calls YouTube's transcript
    JSON endpoint directly. Doesn't trip the bot-check that started rejecting
@@ -11,9 +11,19 @@ module detects YouTube URLs and pulls captions through a two-tier path:
    transcript for the video. Honors $WEBSEARCH_YT_COOKIES_FROM (values:
    safari / chrome / firefox / edge) to pass browser cookies and clear
    YouTube's bot challenge.
+3. `faster-whisper` (opt-in via `use_whisper=True`) — for captionless
+   videos. Downloads the worst-quality audio stream via yt-dlp (it gets
+   resampled to 16kHz mono regardless) and transcribes locally.
+
+Successful transcripts are prepended with a markdown header carrying
+title, channel, duration, upload date, view count, and chapter markers
+so the reader gets a "card" they can navigate without playing the video.
+Metadata is fetched separately via `yt-dlp --dump-json --skip-download`;
+failure to get metadata downgrades silently — never blocks a transcript.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -108,15 +118,281 @@ def _fetch_via_api(url: str, lang: str) -> tuple[str, Optional[str]]:
     return (text, None) if text else ("", "youtube-transcript-api: empty transcript")
 
 
-def fetch_transcript(url: str, timeout: int = 60, lang: str = "en") -> tuple[str, Optional[str]]:
+def _format_duration(seconds: Optional[float]) -> str:
+    """24180 -> '6h43m'. Returns '' if seconds is missing."""
+    if not seconds:
+        return ""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def _format_views(n: Optional[int]) -> str:
+    """1234567 -> '1.2M'. Returns '' if n is missing."""
+    if not n:
+        return ""
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
+
+
+def _format_upload_date(s: Optional[str]) -> str:
+    """'20240115' -> '2024-01-15'. Returns the input if it doesn't parse."""
+    if not s or len(s) != 8 or not s.isdigit():
+        return s or ""
+    return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+
+
+def _format_chapters(chapters: Optional[list], limit: int = 30) -> str:
+    """Render yt-dlp chapter list as `MM:SS Title` lines. Empty → ''."""
+    if not chapters:
+        return ""
+    out: list[str] = []
+    for ch in chapters[:limit]:
+        start = ch.get("start_time") or 0
+        title = (ch.get("title") or "").strip()
+        if not title:
+            continue
+        s = int(start)
+        if s >= 3600:
+            ts = f"{s//3600}:{(s%3600)//60:02d}:{s%60:02d}"
+        else:
+            ts = f"{s//60:02d}:{s%60:02d}"
+        out.append(f"  {ts}  {title}")
+    if len(chapters) > limit:
+        out.append(f"  ... ({len(chapters) - limit} more)")
+    return "\n".join(out)
+
+
+def _fetch_metadata_via_yt_dlp(url: str, timeout: int) -> dict:
+    """Try yt-dlp --dump-json. Bot-checked without cookies on most ASNs in
+    2026, so this often returns {}; callers fall back to oembed."""
+    if not have_yt_dlp():
+        return {}
+    cmd = ["yt-dlp", "--quiet", "--no-warnings", "--skip-download",
+           "--dump-json"]
+    cookies_from = os.environ.get("WEBSEARCH_YT_COOKIES_FROM")
+    if cookies_from:
+        cmd += ["--cookies-from-browser", cookies_from]
+    cmd += ["--", url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return {}
+    if r.returncode != 0 or not r.stdout:
+        return {}
+    try:
+        # --dump-json emits one JSON object per video; --skip-download keeps
+        # it to a single object for a single URL.
+        return json.loads(r.stdout.decode("utf-8", errors="replace").splitlines()[0])
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _fetch_metadata_via_oembed(url: str, timeout: int) -> dict:
+    """No-auth fallback: YouTube's public oembed endpoint.
+
+    Returns a thinner dict (title + channel only — no duration, chapters,
+    view count, upload date, or description) but works without cookies and
+    against the same bot-checked endpoints that block yt-dlp. We normalize
+    the field names to match what `_format_video_header` expects.
+    """
+    import urllib.parse
+    import urllib.request
+
+    api = "https://www.youtube.com/oembed?" + urllib.parse.urlencode({
+        "url": url, "format": "json",
+    })
+    try:
+        with urllib.request.urlopen(api, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        "title": data.get("title") or "",
+        "channel": data.get("author_name") or "",
+        # Mark as oembed-sourced so callers can tell it's the thin variant
+        # if they ever need to (no behavioural use yet).
+        "_source": "oembed",
+    }
+
+
+def fetch_metadata(url: str, timeout: int = 15) -> dict:
+    """Pull video metadata. Tries yt-dlp first (rich: duration/chapters/
+    views/upload date), then YouTube's oembed endpoint as a no-auth
+    fallback (thin: title + channel only).
+
+    Returns {} when both sources fail — metadata is pure enrichment, never
+    a hard requirement for the transcript path.
+    """
+    meta = _fetch_metadata_via_yt_dlp(url, timeout)
+    if meta:
+        return meta
+    return _fetch_metadata_via_oembed(url, timeout)
+
+
+_DESC_MAX_CHARS = 240
+
+
+def _format_video_header(meta: dict) -> str:
+    """Render the metadata dict as a markdown header block. Empty meta → ''."""
+    if not meta:
+        return ""
+    title = (meta.get("title") or "").strip()
+    channel = (meta.get("channel") or meta.get("uploader") or "").strip()
+    duration = _format_duration(meta.get("duration"))
+    uploaded = _format_upload_date(meta.get("upload_date"))
+    views = _format_views(meta.get("view_count"))
+    description = (meta.get("description") or "").strip()
+    chapters_md = _format_chapters(meta.get("chapters"))
+
+    lines: list[str] = []
+    if title:
+        lines.append(f"# YouTube: {title}")
+    facts = []
+    if channel:
+        facts.append(f"Channel: {channel}")
+    if duration:
+        facts.append(f"Duration: {duration}")
+    if uploaded:
+        facts.append(f"Uploaded: {uploaded}")
+    if views:
+        facts.append(f"Views: {views}")
+    if facts:
+        lines.append(" | ".join(facts))
+    if description:
+        truncated = description[:_DESC_MAX_CHARS]
+        if len(description) > _DESC_MAX_CHARS:
+            truncated += "..."
+        # Collapse internal newlines so the description stays in one block.
+        truncated = re.sub(r"\s*\n\s*", " ", truncated)
+        lines.append("")
+        lines.append(f"_{truncated}_")
+    if chapters_md:
+        lines.append("")
+        lines.append("Chapters:")
+        lines.append(chapters_md)
+    lines.append("")
+    lines.append("--- Transcript ---")
+    return "\n".join(lines) + "\n"
+
+
+def _have_faster_whisper() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def have_faster_whisper() -> bool:
+    """Public alias used by doctor + cli."""
+    return _have_faster_whisper()
+
+
+def _fetch_via_whisper(url: str, timeout: int = 600) -> tuple[str, Optional[str]]:
+    """Download audio via yt-dlp + transcribe locally with faster-whisper.
+
+    Opt-in only (gated by --whisper). Uses the lowest-bitrate audio stream
+    since faster-whisper resamples to 16kHz mono anyway. Model size comes
+    from $WEBSEARCH_WHISPER_MODEL (default 'small'); larger models give
+    better accuracy at significant CPU/time cost.
+    """
+    if not have_yt_dlp():
+        return "", "whisper: yt-dlp not installed (needed to download audio)"
+    if not _have_faster_whisper():
+        return "", ("whisper: faster-whisper not installed — "
+                    "`pipx inject websearch faster-whisper`")
+    with tempfile.TemporaryDirectory() as tmp:
+        out_tpl = str(Path(tmp) / "%(id)s.%(ext)s")
+        # `-f worstaudio` keeps the download tiny; whisper doesn't benefit
+        # from high-bitrate audio (it downsamples internally).
+        cmd = [
+            "yt-dlp", "--quiet", "--no-warnings",
+            "-f", "worstaudio/worst",
+            "-x", "--audio-format", "mp3", "--audio-quality", "9",
+            "-o", out_tpl,
+        ]
+        cookies_from = os.environ.get("WEBSEARCH_YT_COOKIES_FROM")
+        if cookies_from:
+            cmd += ["--cookies-from-browser", cookies_from]
+        cmd += ["--", url]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout // 2,
+                               check=False)
+        except subprocess.TimeoutExpired:
+            return "", f"whisper: yt-dlp audio download timed out (>{timeout//2}s)"
+        if r.returncode != 0:
+            err = r.stderr.decode("utf-8", errors="replace").strip()[:300]
+            return "", f"whisper: yt-dlp audio download failed: {err}"
+        audios = sorted(Path(tmp).glob("*.mp3"))
+        if not audios:
+            audios = sorted(Path(tmp).glob("*"))  # whatever yt-dlp produced
+        if not audios:
+            return "", "whisper: yt-dlp produced no audio file"
+
+        from faster_whisper import WhisperModel  # type: ignore
+        model_size = os.environ.get("WEBSEARCH_WHISPER_MODEL", "small")
+        try:
+            # CPU is the only universally-available compute target; the
+            # int8 quantization runs cleanly on Apple Silicon and modest
+            # x86 boxes alike. Users with CUDA can override via env.
+            device = os.environ.get("WEBSEARCH_WHISPER_DEVICE", "cpu")
+            compute = os.environ.get("WEBSEARCH_WHISPER_COMPUTE", "int8")
+            model = WhisperModel(model_size, device=device, compute_type=compute)
+        except Exception as e:  # noqa: BLE001
+            return "", f"whisper: model load failed ({model_size!r}): {e}"
+        try:
+            segments, _info = model.transcribe(str(audios[0]), beam_size=1)
+            parts = [(seg.text or "").strip() for seg in segments]
+        except Exception as e:  # noqa: BLE001
+            return "", f"whisper: transcription failed: {e}"
+        text = "\n".join(p for p in parts if p)
+        return (text, None) if text else ("", "whisper: empty transcript")
+
+
+def fetch_transcript(
+    url: str,
+    timeout: int = 60,
+    lang: str = "en",
+    use_whisper: bool = False,
+    include_metadata: bool = True,
+) -> tuple[str, Optional[str]]:
     """Return (text, error). On error, text is "" and error explains why.
 
-    Tries youtube-transcript-api first (no auth, no bot-check), falls back
-    to yt-dlp + browser-cookies if configured.
+    Tiered path: youtube-transcript-api (no auth) -> yt-dlp + browser
+    cookies -> faster-whisper (only if `use_whisper=True`). Successful
+    output is prepended with a markdown header carrying title/channel/
+    duration/upload date/views/chapters when `include_metadata=True`.
     """
+    def _wrap(transcript: str) -> str:
+        if not include_metadata or not transcript:
+            return transcript
+        header = _format_video_header(fetch_metadata(url))
+        return f"{header}\n{transcript}" if header else transcript
+
     text, api_err = _fetch_via_api(url, lang)
     if text:
-        return text, None
+        return _wrap(text), None
+
+    yt_err: Optional[str] = None
+    if have_yt_dlp():
+        text, yt_err = _fetch_via_yt_dlp_subs(url, timeout, lang)
+        if text:
+            return _wrap(text), None
+
+    if use_whisper:
+        text, w_err = _fetch_via_whisper(url, timeout=max(timeout, 600))
+        if text:
+            return _wrap(text), None
+        return "", _combine_errors(api_err, yt_err, w_err)
 
     if not have_yt_dlp():
         return "", (
@@ -124,7 +400,13 @@ def fetch_transcript(url: str, timeout: int = 60, lang: str = "en") -> tuple[str
             "`pipx inject websearch youtube-transcript-api` for the API path, "
             "or `brew install yt-dlp` for the fallback."
         )
+    return "", _combine_errors(api_err, yt_err, None)
 
+
+def _fetch_via_yt_dlp_subs(
+    url: str, timeout: int, lang: str
+) -> tuple[str, Optional[str]]:
+    """yt-dlp --write-auto-subs path. Returns (text, error)."""
     with tempfile.TemporaryDirectory() as tmp:
         out_tpl = str(Path(tmp) / "%(id)s.%(ext)s")
         cmd = [
@@ -148,20 +430,25 @@ def fetch_transcript(url: str, timeout: int = 60, lang: str = "en") -> tuple[str
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
-            return "", f"yt-dlp timed out after {timeout}s (api: {api_err})"
+            return "", f"yt-dlp timed out after {timeout}s"
         if r.returncode != 0:
             err = r.stderr.decode("utf-8", errors="replace").strip()
             hint = ""
             if "Sign in to confirm" in err and not cookies_from:
                 hint = (" — set $WEBSEARCH_YT_COOKIES_FROM=safari (or "
                         "chrome/firefox/edge) so yt-dlp can pass browser "
-                        "cookies, or install youtube-transcript-api")
-            return "", f"yt-dlp rc={r.returncode}: {err[:300]}{hint} (api: {api_err})"
+                        "cookies, install youtube-transcript-api, or "
+                        "re-run with --whisper for a local transcription")
+            return "", f"yt-dlp rc={r.returncode}: {err[:300]}{hint}"
         vtts = sorted(Path(tmp).glob("*.vtt"))
         if not vtts:
-            return "", (
-                f"no subtitles produced (video may have none / be private / "
-                f"geo-locked) (api: {api_err})"
-            )
+            return "", ("no subtitles produced (video may have none / be "
+                        "private / geo-locked; --whisper would transcribe "
+                        "from audio)")
         raw = vtts[0].read_text(encoding="utf-8", errors="replace")
         return _vtt_to_text(raw), None
+
+
+def _combine_errors(*errs: Optional[str]) -> str:
+    """Join non-empty error strings with `; `."""
+    return "; ".join(e for e in errs if e)

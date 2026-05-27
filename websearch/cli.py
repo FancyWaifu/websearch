@@ -732,6 +732,7 @@ def cmd_research(args: argparse.Namespace) -> int:
                 cache=_resolve_cache(args),
                 max_age=args.max_age,
                 refresh=args.refresh,
+                use_whisper=getattr(args, "whisper", False),
             ),
         )
         report["_backfilled"] = n_backfilled
@@ -787,6 +788,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     bkwargs = _body_kwargs(args)
     verify = not getattr(args, "insecure", False)
 
+    use_whisper = getattr(args, "whisper", False)
+
     # Single URL
     if len(args.urls) == 1:
         url = args.urls[0]
@@ -799,11 +802,11 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             verify=verify,
         )
         if args.via == "direct":
-            result = fetch_direct(url, **kwargs)
+            result = fetch_direct(url, use_whisper=use_whisper, **kwargs)
         elif args.via == "wayback":
             result = fetch_wayback(url, **kwargs)
         else:
-            result = fetch_smart(url, **kwargs)
+            result = fetch_smart(url, use_whisper=use_whisper, **kwargs)
 
         if args.json:
             body = _postprocess_body(result.text, result.content_type, **bkwargs)
@@ -842,6 +845,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         max_age=args.max_age,
         refresh=args.refresh,
         verify=verify,
+        use_whisper=use_whisper,
     )
 
     if args.json:
@@ -1307,6 +1311,13 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--json", action="store_true", help="emit JSON envelope")
     f.add_argument("--timeout", type=int, default=20, help="request timeout in seconds")
     f.add_argument(
+        "--whisper",
+        action="store_true",
+        help="for YouTube URLs with no captions, download audio and transcribe "
+        "locally via faster-whisper (needs `pipx inject websearch faster-whisper`). "
+        "Model size: $WEBSEARCH_WHISPER_MODEL (default 'small').",
+    )
+    f.add_argument(
         "--max-chars",
         type=int,
         default=None,
@@ -1365,6 +1376,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["article", "tables", "raw"],
         default="article",
     )
+    t.add_argument("--whisper", action="store_true", help="YT captionless videos via faster-whisper")
     t.add_argument(
         "--insecure",
         "-k",
@@ -1458,6 +1470,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_proxy_arg(rs)
     _add_searxng_arg(rs)
     _add_cache_args(rs)
+    rs.add_argument(
+        "--whisper",
+        action="store_true",
+        help="for any YouTube source with no captions, transcribe audio "
+        "locally via faster-whisper (opt-in, slow). See `fetch --whisper`.",
+    )
     # Research defaults: favor clean sources out of the box
     rs.set_defaults(func=cmd_research, trust="medium")
 

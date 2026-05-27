@@ -17,6 +17,7 @@ from websearch.transcripts import (
     _format_video_header,
     _format_views,
     _video_id,
+    _yt_dlp_error_hint,
     fetch_metadata,
 )
 
@@ -223,6 +224,61 @@ def test_fetch_metadata_parses_yt_dlp_json(monkeypatch):
     assert meta["title"] == "T"
     assert meta["channel"] == "C"
     assert meta["view_count"] == 100
+
+
+# ---------- yt-dlp error hint surfacing ----------
+
+def test_yt_dlp_error_hint_empty_input_returns_empty():
+    assert _yt_dlp_error_hint("") == ""
+    assert _yt_dlp_error_hint("totally unrelated error") == ""
+
+
+def test_yt_dlp_error_hint_sign_in_to_confirm():
+    err = "ERROR: [youtube] x: Sign in to confirm you're not a bot. Use --cookies..."
+    out = _yt_dlp_error_hint(err)
+    assert "WEBSEARCH_YT_COOKIES_FROM" in out
+    assert "firefox" in out
+
+
+def test_yt_dlp_error_hint_suppresses_signin_when_cookies_set():
+    """If cookies are already configured, telling the user to set cookies is
+    counterproductive — they did, and yt-dlp is still failing for a different
+    reason. Only fire the OTHER hints in that case."""
+    err = "Sign in to confirm — also n challenge solving failed"
+    with_cookies = _yt_dlp_error_hint(err, cookies_set=True)
+    assert "WEBSEARCH_YT_COOKIES_FROM" not in with_cookies
+    assert "yt-dlp-ejs" in with_cookies
+
+
+def test_yt_dlp_error_hint_n_challenge():
+    err = "WARNING: [youtube] x: n challenge solving failed"
+    out = _yt_dlp_error_hint(err)
+    assert "yt-dlp-ejs" in out
+    assert "EJS" in out
+
+
+def test_yt_dlp_error_hint_po_token():
+    err = "tv_simply client formats require a GVS PO Token"
+    out = _yt_dlp_error_hint(err)
+    assert "PO Token" in out
+    assert "bgutil-ytdlp-pot-provider" in out or "PO-Token-Guide" in out
+
+
+def test_yt_dlp_error_hint_format_unavailable():
+    err = "ERROR: Requested format is not available"
+    out = _yt_dlp_error_hint(err)
+    assert "yt-dlp-ejs" in out or "yt-dlp[default]" in out
+
+
+def test_yt_dlp_error_hint_concatenates_multiple_matches():
+    err = ("Sign in to confirm — n challenge solving failed — "
+           "GVS PO Token required")
+    out = _yt_dlp_error_hint(err)
+    # All three hints should appear; the joiner is " — "
+    assert out.startswith(" — ")
+    assert "WEBSEARCH_YT_COOKIES_FROM" in out
+    assert "yt-dlp-ejs" in out
+    assert "PO Token" in out
 
 
 def test_fetch_metadata_falls_back_to_oembed_on_yt_dlp_failure(monkeypatch):

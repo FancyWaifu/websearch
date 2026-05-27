@@ -7,9 +7,12 @@ about which binary they're actually running.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
+import re
 import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -30,6 +33,54 @@ def _have_faster_whisper() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _yt_dlp_info() -> dict:
+    """yt-dlp availability + version + age in one place."""
+    path = shutil.which("yt-dlp")
+    version, age_days = _yt_dlp_version_and_age(path)
+    return {
+        "available": path is not None,
+        "path": path,
+        "version": version,
+        "age_days": age_days,
+    }
+
+
+def _have_yt_dlp_ejs() -> bool:
+    try:
+        import yt_dlp_ejs  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+_YT_DLP_VERSION_RE = re.compile(r"(\d{4})\.(\d{1,2})\.(\d{1,2})")
+
+
+def _yt_dlp_version_and_age(path: Optional[str]) -> tuple[Optional[str], Optional[int]]:
+    """Return (version_str, age_in_days). YouTube/yt-dlp move fast in 2026 —
+    anything older than ~60 days is likely missing fixes for new YouTube
+    anti-scraping changes. Returns (None, None) if yt-dlp is missing or the
+    version output can't be parsed."""
+    if not path:
+        return None, None
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, timeout=5)
+    except Exception:
+        return None, None
+    if r.returncode != 0:
+        return None, None
+    ver = r.stdout.decode("utf-8", errors="replace").strip()
+    m = _YT_DLP_VERSION_RE.search(ver)
+    if not m:
+        return ver, None
+    try:
+        d = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return ver, None
+    age = (_dt.date.today() - d).days
+    return ver, age
 
 
 def _path_entries() -> list[str]:
@@ -181,9 +232,9 @@ def report(proxy: Optional[str] = None) -> dict:
             "available": pdfx.have_pdftotext(),
             "path": shutil.which("pdftotext"),
         },
-        "yt_dlp": {
-            "available": shutil.which("yt-dlp") is not None,
-            "path": shutil.which("yt-dlp"),
+        "yt_dlp": _yt_dlp_info(),
+        "yt_dlp_ejs": {
+            "available": _have_yt_dlp_ejs(),
         },
         "youtube_transcript_api": {
             "available": _have_yt_api(),
@@ -257,24 +308,37 @@ def format_human(rep: dict) -> str:
     tools.append(f"  pdftotext  : {mark}  ({info.get('path') or '-'})")
 
     # yt_dlp itself works fine, but YouTube has bot-checked the anonymous
-    # path since early 2026 — without cookies, transcript fetches fail with
-    # "Sign in to confirm you're not a bot". Mark accordingly so `doctor`
-    # doesn't lull the user into thinking YT transcripts will Just Work.
+    # path since early 2026 — without cookies (and as of mid-2026, an EJS
+    # solver + PO Token), transcript fetches and audio downloads fail.
     yt_info = rep.get("yt_dlp", {})
     yt_api = rep.get("youtube_transcript_api", {})
+    yt_ejs = rep.get("yt_dlp_ejs", {})
     yt_cookies = rep.get("yt_cookies_from") or ""
     if not yt_info.get("available"):
         yt_mark = "missing"
-    elif yt_cookies:
-        yt_mark = f"ok  (YT cookies: {yt_cookies})"
-    elif yt_api.get("available"):
-        yt_mark = "ok  (YT transcripts route via yt_api; yt_dlp fallback bot-checked without $WEBSEARCH_YT_COOKIES_FROM)"
     else:
-        yt_mark = "ok* (YT transcripts BROKEN without $WEBSEARCH_YT_COOKIES_FROM=safari|chrome|firefox|edge or yt_api)"
+        ver = yt_info.get("version") or "?"
+        age = yt_info.get("age_days")
+        age_part = ""
+        if age is not None:
+            if age > 60:
+                age_part = f" — STALE ({age}d old; YouTube changes break old yt-dlp, run `pip install -U 'yt-dlp[default]'`)"
+            else:
+                age_part = f" ({age}d old)"
+        if yt_cookies:
+            yt_mark = f"ok  v{ver}{age_part}  (YT cookies: {yt_cookies})"
+        elif yt_api.get("available"):
+            yt_mark = f"ok  v{ver}{age_part}  (YT transcripts route via yt_api; yt_dlp fallback bot-checked without $WEBSEARCH_YT_COOKIES_FROM)"
+        else:
+            yt_mark = f"ok* v{ver}{age_part}  (YT transcripts BROKEN without $WEBSEARCH_YT_COOKIES_FROM=firefox|chrome|edge or yt_api)"
     tools.append(f"  yt_dlp     : {yt_mark}  ({yt_info.get('path') or '-'})")
 
     yt_api_mark = "ok" if yt_api.get("available") else "missing (pipx inject websearch youtube-transcript-api)"
     tools.append(f"  yt_api     : {yt_api_mark}")
+    if yt_ejs.get("available"):
+        tools.append("  yt_ejs     : ok  (yt-dlp's JS n-challenge solver — required for YT audio downloads since mid-2026)")
+    else:
+        tools.append("  yt_ejs     : missing (pip install yt-dlp-ejs) — yt-dlp can't solve YouTube's n-challenge without it; audio downloads (and --whisper) will fail with 'Requested format is not available'")
     fw = rep.get("faster_whisper", {})
     if fw.get("available"):
         tools.append(f"  whisper    : ok  (faster-whisper, model={fw.get('model','small')})")

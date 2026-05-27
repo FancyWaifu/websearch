@@ -312,11 +312,15 @@ def _fetch_via_whisper(url: str, timeout: int = 600) -> tuple[str, Optional[str]
                     "`pipx inject websearch faster-whisper`")
     with tempfile.TemporaryDirectory() as tmp:
         out_tpl = str(Path(tmp) / "%(id)s.%(ext)s")
-        # `-f worstaudio` keeps the download tiny; whisper doesn't benefit
-        # from high-bitrate audio (it downsamples internally).
+        # Whisper resamples to 16kHz mono internally, so audio quality
+        # doesn't matter — but format AVAILABILITY does. `bestaudio/worst`
+        # is yt-dlp's documented "always finds something" spec; pure
+        # `worstaudio` returns "Requested format is not available" on some
+        # videos. `--audio-quality 9` (lowest VBR mp3) then keeps the
+        # post-extract file small regardless of the source bitrate.
         cmd = [
             "yt-dlp", "--quiet", "--no-warnings",
-            "-f", "worstaudio/worst",
+            "-f", "bestaudio/worst",
             "-x", "--audio-format", "mp3", "--audio-quality", "9",
             "-o", out_tpl,
         ]
@@ -330,8 +334,11 @@ def _fetch_via_whisper(url: str, timeout: int = 600) -> tuple[str, Optional[str]
         except subprocess.TimeoutExpired:
             return "", f"whisper: yt-dlp audio download timed out (>{timeout//2}s)"
         if r.returncode != 0:
-            err = r.stderr.decode("utf-8", errors="replace").strip()[:300]
-            return "", f"whisper: yt-dlp audio download failed: {err}"
+            err = r.stderr.decode("utf-8", errors="replace").strip()
+            hint = _yt_dlp_error_hint(err, cookies_set=bool(cookies_from))
+            return "", (
+                f"whisper: yt-dlp audio download failed: {err[:300]}{hint}"
+            )
         audios = sorted(Path(tmp).glob("*.mp3"))
         if not audios:
             audios = sorted(Path(tmp).glob("*"))  # whatever yt-dlp produced
@@ -433,12 +440,7 @@ def _fetch_via_yt_dlp_subs(
             return "", f"yt-dlp timed out after {timeout}s"
         if r.returncode != 0:
             err = r.stderr.decode("utf-8", errors="replace").strip()
-            hint = ""
-            if "Sign in to confirm" in err and not cookies_from:
-                hint = (" — set $WEBSEARCH_YT_COOKIES_FROM=safari (or "
-                        "chrome/firefox/edge) so yt-dlp can pass browser "
-                        "cookies, install youtube-transcript-api, or "
-                        "re-run with --whisper for a local transcription")
+            hint = _yt_dlp_error_hint(err, cookies_set=bool(cookies_from))
             return "", f"yt-dlp rc={r.returncode}: {err[:300]}{hint}"
         vtts = sorted(Path(tmp).glob("*.vtt"))
         if not vtts:
@@ -452,3 +454,54 @@ def _fetch_via_yt_dlp_subs(
 def _combine_errors(*errs: Optional[str]) -> str:
     """Join non-empty error strings with `; `."""
     return "; ".join(e for e in errs if e)
+
+
+# YouTube's mid-2026 anti-yt-dlp escalation surfaced several new failure
+# modes whose default error text is unhelpful ("Requested format is not
+# available" doesn't tell you to install yt-dlp-ejs). Each entry pairs a
+# stderr fragment with an actionable hint; multiple matches concatenate so
+# the user sees the whole picture in one error.
+_YT_DLP_HINT_PATTERNS = (
+    (
+        "Sign in to confirm",
+        "set $WEBSEARCH_YT_COOKIES_FROM=firefox (or chrome/edge — Safari "
+        "cookies are sandboxed on macOS and need Full Disk Access to read)",
+    ),
+    (
+        "n challenge solving failed",
+        "install the n-challenge solver: `pip install yt-dlp-ejs` and make "
+        "sure node/deno is on PATH (yt-dlp/wiki/EJS)",
+    ),
+    (
+        "GVS PO Token",
+        "yt-dlp needs a PO Token: install `bgutil-ytdlp-pot-provider` or "
+        "follow yt-dlp/wiki/PO-Token-Guide",
+    ),
+    (
+        "Requested format is not available",
+        "YouTube isn't serving downloadable formats to this client; usually "
+        "fixed by `pip install -U 'yt-dlp[default]' yt-dlp-ejs` and "
+        "$WEBSEARCH_YT_COOKIES_FROM=firefox",
+    ),
+    (
+        "SABR-only",
+        "YouTube enabled SABR streaming for this account/IP; try "
+        "`--extractor-args 'youtube:player_client=web_safari,mweb'`",
+    ),
+)
+
+
+def _yt_dlp_error_hint(stderr: str, *, cookies_set: bool = False) -> str:
+    """Return one consolidated hint for known yt-dlp failures, or "".
+
+    `cookies_set=True` suppresses the Sign-in hint (the user already did
+    the cookie step, the failure is something else)."""
+    if not stderr:
+        return ""
+    hints: list[str] = []
+    for pattern, hint in _YT_DLP_HINT_PATTERNS:
+        if pattern == "Sign in to confirm" and cookies_set:
+            continue
+        if pattern in stderr:
+            hints.append(hint)
+    return " — " + "; ".join(hints) if hints else ""

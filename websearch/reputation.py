@@ -102,6 +102,10 @@ BLOCKLIST: set[str] = {
     "powermoves.blog",
     "talkofthehouse.com",
     "lumbercapital.com",
+    # Second pass on Marathon re-run after the first tuning round —
+    # these backfilled into fetch slots once the worse offenders dropped.
+    "boosting-ground.com",   # game-boosting service marketing as news
+    "fandomwire.com",        # gaming content farm / aggregator
 }
 
 

@@ -18,6 +18,35 @@ def test_score_blocklist_dominates():
     assert reputation.score("https://www.answers.com/q/foo") == -10
 
 
+def test_score_seo_farms_added_to_blocklist():
+    """The 2026-05-27 blocklist additions — domains observed outranking
+    real press during research probes."""
+    for url in (
+        "https://invisioncommunity.co.uk/marathon-2026-bungies-extraction-shooter-is-it-succeeding/",
+        "https://www.exitlag.com/blog/marathon/",
+        "https://powermoves.blog/smart-home",
+        "https://talkofthehouse.com/best-smart-home",
+        "https://lumbercapital.com/2x4-prices",
+    ):
+        assert reputation.score(url) == -10, f"{url} should be blocklisted"
+
+
+def test_score_gaming_and_tech_press_in_news_allowlist():
+    """Gaming/tech press should land at +3 (news category) — without this
+    they tie at 0 with random SEO blogs in research result ranking."""
+    for url in (
+        "https://www.ign.com/articles/anything",
+        "https://www.videogameschronicle.com/review/anything",
+        "https://www.gamedeveloper.com/business/anything",
+        "https://www.polygon.com/anything",
+        "https://www.eurogamer.net/anything",
+        "https://www.pcgamer.com/anything",
+        "https://arstechnica.com/anything",
+        "https://www.theverge.com/anything",
+    ):
+        assert reputation.score(url) == 3, f"{url} should match news allowlist"
+
+
 def test_score_trusted_tld_and_allowlist_combine():
     # cdc.gov is in the gov allowlist (+3) AND has a trusted TLD (.gov, +2)
     assert reputation.score("https://www.cdc.gov/page") == 5

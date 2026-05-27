@@ -94,6 +94,14 @@ BLOCKLIST: set[str] = {
     "ehow.com",
     "chegg.com",
     "coursehero.com",
+    # 2026-05-27 — observed outranking real press in Marathon/best-vpn/
+    # smart-home queries; pure SEO/affiliate content with no original
+    # reporting. Curate further via `websearch reputation block <domain>`.
+    "invisioncommunity.co.uk",
+    "exitlag.com",
+    "powermoves.blog",
+    "talkofthehouse.com",
+    "lumbercapital.com",
 }
 
 
@@ -142,6 +150,7 @@ TRUSTED: dict[str, set[str]] = {
         "congress.gov",
     },
     "news": {
+        # General news
         "reuters.com",
         "apnews.com",
         "bbc.com",
@@ -158,6 +167,33 @@ TRUSTED: dict[str, set[str]] = {
         "propublica.org",
         "theatlantic.com",
         "newyorker.com",
+        # Tech / general-tech press — original reporting, editorial
+        # standards. Without these, gaming and tech research lets random
+        # SEO blogs tie at score 0 with established outlets.
+        "arstechnica.com",
+        "theverge.com",
+        "wired.com",
+        "techcrunch.com",
+        "engadget.com",
+        "404media.co",
+        # Gaming press — same reasoning. Verified to do original reporting,
+        # not just aggregate listicles. Marathon research surfaced VGC,
+        # IGN, GameDeveloper, Eurogamer, PCGamer as the actually-useful
+        # sources; they should outrank generic gaming blogs.
+        "ign.com",
+        "gamespot.com",
+        "polygon.com",
+        "eurogamer.net",
+        "kotaku.com",
+        "rockpapershotgun.com",
+        "vg247.com",
+        "videogameschronicle.com",
+        "gamedeveloper.com",
+        "pcgamer.com",
+        "gamesradar.com",
+        "gameinformer.com",
+        "destructoid.com",
+        "pcgamesn.com",
     },
     "reference": {
         "en.wikipedia.org",

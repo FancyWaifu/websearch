@@ -177,7 +177,7 @@ def _fetch_metadata_via_yt_dlp(url: str, timeout: int) -> dict:
     if not have_yt_dlp():
         return {}
     cmd = ["yt-dlp", "--quiet", "--no-warnings", "--skip-download",
-           "--dump-json"]
+           "--dump-json", *_yt_dlp_runtime_args()]
     cookies_from = os.environ.get("WEBSEARCH_YT_COOKIES_FROM")
     if cookies_from:
         cmd += ["--cookies-from-browser", cookies_from]
@@ -297,6 +297,20 @@ def have_faster_whisper() -> bool:
     return _have_faster_whisper()
 
 
+def _yt_dlp_runtime_args() -> list[str]:
+    """yt-dlp defaults to enabling only `deno` as a JS runtime, but Node is
+    far more commonly installed. Without an enabled runtime, YouTube's
+    n-challenge can't be solved and ALL downloadable formats are filtered
+    out — yt-dlp returns "Requested format is not available". Explicitly
+    enable a runtime; default to `node` since it's the common case.
+
+    Override via $WEBSEARCH_YT_JS_RUNTIME (e.g. `deno`, `bun`). Empty
+    string opts out entirely (keeps yt-dlp's default behavior).
+    """
+    runtime = os.environ.get("WEBSEARCH_YT_JS_RUNTIME", "node")
+    return ["--js-runtimes", runtime] if runtime else []
+
+
 def _fetch_via_whisper(url: str, timeout: int = 600) -> tuple[str, Optional[str]]:
     """Download audio via yt-dlp + transcribe locally with faster-whisper.
 
@@ -320,6 +334,7 @@ def _fetch_via_whisper(url: str, timeout: int = 600) -> tuple[str, Optional[str]
         # post-extract file small regardless of the source bitrate.
         cmd = [
             "yt-dlp", "--quiet", "--no-warnings",
+            *_yt_dlp_runtime_args(),
             "-f", "bestaudio/worst",
             "-x", "--audio-format", "mp3", "--audio-quality", "9",
             "-o", out_tpl,
@@ -420,6 +435,7 @@ def _fetch_via_yt_dlp_subs(
             "yt-dlp",
             "--quiet",
             "--no-warnings",
+            *_yt_dlp_runtime_args(),
             "--skip-download",
             "--write-auto-subs",
             "--write-subs",

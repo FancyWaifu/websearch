@@ -48,11 +48,52 @@ def _yt_dlp_info() -> dict:
 
 
 def _have_yt_dlp_ejs() -> bool:
+    """Import-time check — accurate only if yt-dlp lives in THIS Python.
+    Most users have yt-dlp installed in a separate env (system python /
+    homebrew / pipx-isolated), so this returns False even when yt-dlp
+    can find yt-dlp-ejs in its own env. Kept for tests; doctor uses
+    `_yt_dlp_probe` which queries yt-dlp's actual environment."""
     try:
         import yt_dlp_ejs  # noqa: F401
         return True
     except ImportError:
         return False
+
+
+def _yt_dlp_probe(path: Optional[str], runtime: Optional[str] = None) -> dict:
+    """Ask yt-dlp itself what optional libraries it sees and which JS
+    runtimes it can use. Runs `yt-dlp --verbose --simulate <fake-url>`
+    which is cheap (no network) and emits the `[debug] Optional libraries`
+    + `[debug] JS runtimes` lines we need. ~200ms.
+
+    The JS runtime question matters because yt-dlp defaults to only
+    enabling `deno` — even with node/bun installed and yt_dlp_ejs present,
+    YouTube's n-challenge can't be solved unless the user passes
+    `--js-runtimes node` (or sets $WEBSEARCH_YT_JS_RUNTIME so websearch
+    passes it). Without that, audio downloads fail with
+    "Requested format is not available".
+    """
+    if not path:
+        return {}
+    runtime = runtime if runtime is not None else os.environ.get(
+        "WEBSEARCH_YT_JS_RUNTIME", "node")
+    cmd = [path, "--verbose", "--simulate", "https://websearch.probe.invalid/"]
+    if runtime:
+        cmd[1:1] = ["--js-runtimes", runtime]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=10)
+    except Exception:
+        return {}
+    text = (r.stdout + r.stderr).decode("utf-8", errors="replace")
+    out: dict = {"runtime_requested": runtime}
+    for line in text.splitlines():
+        if line.startswith("[debug] Optional libraries:"):
+            libs = line.split(":", 1)[1].strip()
+            out["yt_dlp_ejs"] = "yt_dlp_ejs" in libs
+            out["optional_libs"] = libs
+        elif line.startswith("[debug] JS runtimes:"):
+            out["js_runtimes"] = line.split(":", 1)[1].strip()
+    return out
 
 
 _YT_DLP_VERSION_RE = re.compile(r"(\d{4})\.(\d{1,2})\.(\d{1,2})")
@@ -233,9 +274,10 @@ def report(proxy: Optional[str] = None) -> dict:
             "path": shutil.which("pdftotext"),
         },
         "yt_dlp": _yt_dlp_info(),
-        "yt_dlp_ejs": {
-            "available": _have_yt_dlp_ejs(),
-        },
+        # Probe yt-dlp's own env (NOT this Python) — yt-dlp typically lives in
+        # a separate venv, so a Python-side import check would give the wrong
+        # answer. See _yt_dlp_probe docstring.
+        "yt_dlp_probe": _yt_dlp_probe(shutil.which("yt-dlp")),
         "youtube_transcript_api": {
             "available": _have_yt_api(),
         },
@@ -312,7 +354,7 @@ def format_human(rep: dict) -> str:
     # solver + PO Token), transcript fetches and audio downloads fail.
     yt_info = rep.get("yt_dlp", {})
     yt_api = rep.get("youtube_transcript_api", {})
-    yt_ejs = rep.get("yt_dlp_ejs", {})
+    yt_probe = rep.get("yt_dlp_probe", {})
     yt_cookies = rep.get("yt_cookies_from") or ""
     if not yt_info.get("available"):
         yt_mark = "missing"
@@ -335,10 +377,22 @@ def format_human(rep: dict) -> str:
 
     yt_api_mark = "ok" if yt_api.get("available") else "missing (pipx inject websearch youtube-transcript-api)"
     tools.append(f"  yt_api     : {yt_api_mark}")
-    if yt_ejs.get("available"):
-        tools.append("  yt_ejs     : ok  (yt-dlp's JS n-challenge solver — required for YT audio downloads since mid-2026)")
-    else:
-        tools.append("  yt_ejs     : missing (pip install yt-dlp-ejs) — yt-dlp can't solve YouTube's n-challenge without it; audio downloads (and --whisper) will fail with 'Requested format is not available'")
+
+    # EJS + JS runtime status comes from probing yt-dlp's own env (not the
+    # websearch venv). Both pieces are needed for YouTube audio downloads
+    # (transcript --whisper) since mid-2026.
+    if yt_info.get("available"):
+        has_ejs = yt_probe.get("yt_dlp_ejs", False)
+        runtimes = yt_probe.get("js_runtimes", "none")
+        runtime_active = runtimes and runtimes != "none"
+        if has_ejs and runtime_active:
+            tools.append(f"  yt_ejs     : ok  (yt_dlp_ejs + JS runtime: {runtimes}) — YT audio downloads should work")
+        elif has_ejs and not runtime_active:
+            tools.append(f"  yt_ejs     : partial — yt_dlp_ejs is installed but no JS runtime detected (needed: node/deno/bun/quickjs). Install Node: `brew install node`")
+        elif not has_ejs and runtime_active:
+            tools.append(f"  yt_ejs     : partial — JS runtime {runtimes} is available but yt_dlp_ejs is missing. Install: `pip install yt-dlp-ejs` (into yt-dlp's Python env, not this one)")
+        else:
+            tools.append("  yt_ejs     : missing  (need BOTH `pip install yt-dlp-ejs` and a JS runtime like `brew install node`). YT audio downloads will fail with 'Requested format is not available'.")
     fw = rep.get("faster_whisper", {})
     if fw.get("available"):
         tools.append(f"  whisper    : ok  (faster-whisper, model={fw.get('model','small')})")

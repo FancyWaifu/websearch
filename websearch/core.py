@@ -1413,23 +1413,51 @@ def search_many(
 
     out: dict = {"queries": per_query}
     if dedupe:
-        seen: set[str] = set()
-        merged: list[dict] = []
-        for q in queries:
-            for r in per_query.get(q, {}).get("results", []):
-                # Canonicalize before dedup so the same document under
-                # different URL shapes (arxiv abs/pdf/html, m. mobile
-                # subdomains, etc.) collapses to one slot.
-                key = _canonical_url(r["url"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append({**r, "from_query": q})
+        merged = _interleave_dedupe(queries, per_query)
         # Re-apply reputation across the merged list so prefer/trust work
         # against the combined pool, not just within each query.
         merged = reputation.filter_and_rank(merged, trust=trust, prefer=prefer)
         out["unique"] = merged
     return out
+
+
+def _interleave_dedupe(queries: list[str], per_query: dict) -> list[dict]:
+    """Round-robin merge across queries, deduping by canonical URL.
+
+    Old behavior was sequential: take all of query[0]'s results, then
+    query[1]'s, then query[2]'s. After reputation/rerank, the top depth
+    fetch slots concentrated on whichever query the rerank favored —
+    surfaced as N-1-of-N queries getting zero coverage. Self-research on
+    "how to make websearch better" lost 3 of 4 queries this way.
+
+    New behavior: take rank-1 from each query, then rank-2 from each,
+    etc. Each query gets equal representation in the early slots, so
+    fetch depth divides cleanly across queries when downstream rerank
+    doesn't disturb the order.
+    """
+    seen: set[str] = set()
+    merged: list[dict] = []
+    # Each query's result list, padded to the longest. None entries are
+    # skipped — they represent "this query had fewer results than that
+    # one and there's nothing to take here."
+    per_query_results = [per_query.get(q, {}).get("results", []) for q in queries]
+    if not per_query_results:
+        return merged
+    max_len = max(len(rs) for rs in per_query_results)
+    for rank_pos in range(max_len):
+        for q, results in zip(queries, per_query_results):
+            if rank_pos >= len(results):
+                continue
+            r = results[rank_pos]
+            # Canonicalize before dedup so the same document under
+            # different URL shapes (arxiv abs/pdf/html, m. mobile
+            # subdomains, etc.) collapses to one slot.
+            key = _canonical_url(r["url"])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({**r, "from_query": q})
+    return merged
 
 
 # ----------------------------- Selftest ------------------------------------

@@ -259,6 +259,55 @@ def test_canonical_url_passes_through_unrelated_urls():
     assert _canonical_url("https://example.com/article") == "https://example.com/article"
 
 
+# ---------- Round-robin multi-query merge ----------
+
+def test_interleave_dedupe_round_robins_across_queries():
+    """Each query should contribute its rank-1 first, then rank-2, etc.
+    Old sequential behavior would output q1's whole list first, starving
+    q2/q3 of early slots — and after rerank, of fetch slots."""
+    from websearch.core import _interleave_dedupe
+    per_query = {
+        "q1": {"results": [{"url": "a"}, {"url": "b"}, {"url": "c"}]},
+        "q2": {"results": [{"url": "d"}, {"url": "e"}]},
+        "q3": {"results": [{"url": "f"}]},
+    }
+    merged = _interleave_dedupe(["q1", "q2", "q3"], per_query)
+    urls = [r["url"] for r in merged]
+    # rank-1 from each: a, d, f. then rank-2: b, e. then rank-3: c.
+    assert urls == ["a", "d", "f", "b", "e", "c"]
+    # from_query tag preserved
+    assert merged[0]["from_query"] == "q1"
+    assert merged[1]["from_query"] == "q2"
+    assert merged[2]["from_query"] == "q3"
+
+
+def test_interleave_dedupe_canonicalizes_for_dedup():
+    """arxiv abs and pdf URLs of the same paper should NOT both appear."""
+    from websearch.core import _interleave_dedupe
+    per_query = {
+        "q1": {"results": [{"url": "https://arxiv.org/abs/2506.05364"}]},
+        "q2": {"results": [{"url": "https://arxiv.org/pdf/2506.05364"}]},
+    }
+    merged = _interleave_dedupe(["q1", "q2"], per_query)
+    assert len(merged) == 1
+    assert merged[0]["url"] == "https://arxiv.org/abs/2506.05364"
+
+
+def test_interleave_dedupe_handles_uneven_lengths_and_empty():
+    from websearch.core import _interleave_dedupe
+    assert _interleave_dedupe([], {}) == []
+    assert _interleave_dedupe(["q"], {"q": {"results": []}}) == []
+    # One query has many more results than the other — the long one
+    # should still get all its remaining results after the short one is exhausted.
+    per_query = {
+        "long": {"results": [{"url": f"l{i}"} for i in range(5)]},
+        "short": {"results": [{"url": "s0"}]},
+    }
+    merged = _interleave_dedupe(["long", "short"], per_query)
+    urls = [r["url"] for r in merged]
+    assert urls == ["l0", "s0", "l1", "l2", "l3", "l4"]
+
+
 def test_research_frontmatter_timestamp_has_timezone():
     """Smoke test: build a minimal args/report and check the timestamp shape.
     Format is `YYYY-MM-DDTHH:MM:SS+HH:MM` (or `-HH:MM` / `Z` if UTC)."""

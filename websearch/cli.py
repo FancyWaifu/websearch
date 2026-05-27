@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -18,11 +19,13 @@ try:
         fetch_wayback,
         grep_lines,
         html_to_text,
+        proxy_reachable,
         search_bing,
         search_duckduckgo,
         search_many,
         search_smart,
         selftest,
+        smart_truncate,
     )
     from . import reputation
     from . import rerank as _rerank
@@ -56,6 +59,25 @@ def _add_proxy_arg(p: argparse.ArgumentParser) -> None:
         default=None,
         help="proxy URL (e.g., socks5h://127.0.0.1:1080). "
         "Falls back to $WEBSEARCH_PROXY env var.",
+    )
+
+
+def _add_searxng_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--searxng",
+        default=None,
+        metavar="URL",
+        help="SearXNG instance URL to use as the primary search engine "
+        "(tried before DuckDuckGo/Bing). Falls back to $WEBSEARCH_SEARXNG. "
+        "The instance must have the 'json' format enabled.",
+    )
+    p.add_argument(
+        "--searxng-autostart",
+        default=None,
+        metavar="COMPOSE_OR_NAME",
+        help="if a local SearXNG is down, start it before querying. Value is "
+        "a docker-compose file path or a container name. Falls back to "
+        "$WEBSEARCH_SEARXNG_AUTOSTART.",
     )
 
 
@@ -201,9 +223,7 @@ def _postprocess_body(
     if grep:
         filtered = grep_lines(body, grep, context=grep_context)
         body = filtered if filtered else f"[no lines matched /{grep}/]"
-    if max_chars and len(body) > max_chars:
-        body = body[:max_chars] + f"\n\n... [truncated at {max_chars} chars]"
-    return body
+    return smart_truncate(body, max_chars)
 
 
 def _print_results_text(engine: str, results: list) -> None:
@@ -260,8 +280,12 @@ def _render_compact_report(report: dict, *, header: str | None = None) -> str:
                 f"via={fr.get('via')} status={fr.get('status')}"
                 f" cache={'yes' if fr.get('from_cache') else 'no'}"
             )
+            if fr.get("published_date"):
+                meta += f" published={fr['published_date']}"
             if fr.get("is_pdf"):
                 meta += " [PDF]"
+            if not fr.get("error") and reputation.looks_affiliate(fr.get("body", "")):
+                meta += " [affiliate-disclosure]"
             if fr.get("tried_wayback"):
                 meta += f" wayback_status={fr.get('wayback_status')}"
                 if fr.get("wayback_error"):
@@ -343,11 +367,59 @@ def _body_kwargs(args: argparse.Namespace) -> dict:
 
 def _attach_fetched(container: dict, fetched: list, args: argparse.Namespace) -> None:
     container["fetched"] = []
+    kw = _body_kwargs(args)
+    # --max-total-chars: spread a whole-report budget across the fetched
+    # sources so a research run can't blow past an output ceiling.
+    mtc = getattr(args, "max_total_chars", None)
+    if mtc and fetched:
+        per = max(600, mtc // len(fetched))
+        kw["max_chars"] = min(kw["max_chars"], per) if kw.get("max_chars") else per
     for fr in fetched:
         d = fr.to_dict()
         body = d.pop("text", "")
-        d["body"] = _postprocess_body(body, fr.content_type, **_body_kwargs(args))
+        # Surface the page's published date inline (best-effort, from the
+        # raw HTML before extraction strips the <meta>/JSON-LD tags).
+        if "published_date" not in d:
+            looks_html = "html" in (fr.content_type or "").lower() or body.lstrip().startswith("<")
+            pub = _dates.extract_published(body) if looks_html else None
+            d["published_date"] = pub.isoformat() if pub else None
+        d["body"] = _postprocess_body(body, fr.content_type, **kw)
         container["fetched"].append(d)
+
+
+def _fetch_top_with_backfill(
+    pool: list, depth: int, fetch_kwargs: dict
+) -> tuple[list, int]:
+    """Fetch `depth` usable bodies from the ranked `pool` of result dicts.
+
+    When a top result fails to fetch (dead link, no Wayback snapshot, block
+    page), the next-ranked candidate is pulled in to replace it — so the
+    caller gets `depth` real sources whenever the pool runs deep enough,
+    instead of burning a slot on an error. If the pool is exhausted before
+    `depth` successes, the unrecoverable failures are kept in the returned
+    list so the failure stays visible rather than silently hidden.
+
+    Returns (fetched_results, n_backfilled).
+    """
+    urls = [r["url"] for r in pool]
+    original_top = set(urls[:depth])
+    good: list = []
+    failed: list = []
+    idx = 0
+    while idx < len(urls) and len(good) < depth:
+        need = depth - len(good)
+        batch = urls[idx : idx + need]
+        idx += len(batch)
+        for fr in fetch_many(batch, **fetch_kwargs):
+            if fr.error is None and (fr.text or "").strip():
+                good.append(fr)
+            else:
+                failed.append(fr)
+    fetched = good[:depth]
+    if len(fetched) < depth:
+        fetched += failed[: depth - len(fetched)]
+    n_backfilled = sum(1 for fr in fetched if fr.url not in original_top)
+    return fetched, n_backfilled
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -388,6 +460,8 @@ def cmd_search(args: argparse.Namespace) -> int:
             parallel=args.parallel,
             dedupe=True,
             exclude=exclude or None,
+            searxng=args.searxng,
+            searxng_autostart=args.searxng_autostart,
             **filter_kwargs,
         )
         _apply_rerank_pipeline(report, queries[0], require_terms, do_rerank)
@@ -415,7 +489,9 @@ def cmd_search(args: argparse.Namespace) -> int:
     try:
         if args.engine == "auto":
             engine, results = search_smart(
-                query, max_results=args.max, proxy=proxy, exclude=excl, **filter_kwargs
+                query, max_results=args.max, proxy=proxy, exclude=excl,
+                searxng=args.searxng, searxng_autostart=args.searxng_autostart,
+                **filter_kwargs,
             )
         elif args.engine == "ddg":
             engine, results = "duckduckgo", search_duckduckgo(
@@ -508,7 +584,9 @@ def _apply_rerank_pipeline(
 def _research_frontmatter(args: argparse.Namespace, queries: list[str], report: dict) -> str:
     """YAML frontmatter for piping research output into notes systems."""
     import datetime as _dt
-    proxy_used = bool(args.proxy or __import__("os").environ.get("WEBSEARCH_PROXY"))
+    proxy_conf = bool(args.proxy or os.environ.get("WEBSEARCH_PROXY"))
+    reach = report.get("_proxy_reachable")
+    proxy_used = proxy_conf and reach is True
     unique = report.get("unique", []) or []
     fetched = report.get("fetched", []) or []
     fm = [
@@ -518,8 +596,13 @@ def _research_frontmatter(args: argparse.Namespace, queries: list[str], report: 
         f"trust: {args.trust}",
         f"depth: {args.depth}",
         f"proxy_used: {str(proxy_used).lower()}",
+    ]
+    if proxy_conf and reach is False:
+        fm.append("proxy_note: configured but unreachable — used direct fetches")
+    fm += [
         f"sources_unique: {len(unique)}",
         f"sources_fetched: {len(fetched)}",
+        f"sources_backfilled: {report.get('_backfilled', 0)}",
         "queries:",
     ]
     for q in queries:
@@ -546,6 +629,16 @@ def cmd_research(args: argparse.Namespace) -> int:
         print("error: provide a question (positional or -q)", file=sys.stderr)
         return 2
 
+    # #5: warn loudly when a proxy is configured but dead, instead of
+    # silently falling back to direct (no stealth).
+    reach = proxy_reachable(proxy)
+    if reach is False:
+        print(
+            "WARNING: a proxy is configured (--proxy / $WEBSEARCH_PROXY) but "
+            "unreachable — falling back to direct fetches with no stealth.",
+            file=sys.stderr,
+        )
+
     exclude: list[str] = []
     for e in args.exclude or []:
         exclude.extend([x.strip() for x in e.split(",") if x.strip()])
@@ -564,21 +657,34 @@ def cmd_research(args: argparse.Namespace) -> int:
         since=args.since,
         trust=args.trust,
         prefer=args.prefer,
+        searxng=args.searxng,
+        searxng_autostart=args.searxng_autostart,
     )
 
     _apply_rerank_pipeline(report, queries[0], require_terms, args.rerank)
+    if args.max_per_domain and report.get("unique"):
+        report["unique"] = reputation.cap_per_domain(
+            report["unique"], args.max_per_domain
+        )
+    report["_proxy_reachable"] = reach
+    report["_backfilled"] = 0
 
     if report.get("unique"):
-        top_urls = [r["url"] for r in report["unique"][: args.depth]]
-        fetched = fetch_many(
-            top_urls,
-            timeout=args.timeout,
-            proxy=proxy,
-            parallel=args.parallel,
-            cache=_resolve_cache(args),
-            max_age=args.max_age,
-            refresh=args.refresh,
+        # #4: fetch the top `depth`, backfilling failed fetches from the
+        # rest of the ranked pool so dead links don't waste a source slot.
+        fetched, n_backfilled = _fetch_top_with_backfill(
+            report["unique"],
+            args.depth,
+            dict(
+                timeout=args.timeout,
+                proxy=proxy,
+                parallel=args.parallel,
+                cache=_resolve_cache(args),
+                max_age=args.max_age,
+                refresh=args.refresh,
+            ),
         )
+        report["_backfilled"] = n_backfilled
         if args.enforce_since and args.since:
             fetched = _enforce_since(fetched, args.since)
         _attach_fetched(report, fetched, args)
@@ -1022,10 +1128,32 @@ def cmd_reputation(args: argparse.Namespace) -> int:
         return 0
     if args.action == "list":
         data = reputation.list_category(args.category)
+        data["user_blocklist"] = sorted(reputation.user_blocklist())
+        data["user_allowlist"] = sorted(reputation.user_allowlist())
         print(json.dumps(data, indent=2))
+        return 0
+    if args.action in ("block", "allow", "unblock", "unallow"):
+        kind = "block" if args.action in ("block", "unblock") else "allow"
+        remove = args.action.startswith("un")
+        path = reputation.edit_user_list(kind, args.domain, remove=remove)
+        verb = "removed from" if remove else "added to"
+        print(f"{args.domain} {verb} user {kind}list → {path}")
         return 0
     print(f"unknown reputation action: {args.action}", file=sys.stderr)
     return 2
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """Run websearch as an MCP stdio server (search/fetch/research tools)."""
+    from . import mcp_server
+    try:
+        mcp_server.run()
+    except ImportError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 # ----------------------------- parser ---------------------------------------
@@ -1111,6 +1239,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_body_args(s)
     _add_rerank_args(s)
     _add_proxy_arg(s)
+    _add_searxng_arg(s)
     _add_cache_args(s)
     s.set_defaults(func=cmd_search)
 
@@ -1215,12 +1344,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="how many top URLs to fetch across the deduped result pool (default: 5)",
     )
     rs.add_argument("-n", "--max", type=int, default=10, help="max results per query (default: 10)")
+    rs.add_argument(
+        "--max-per-domain",
+        type=int,
+        default=None,
+        metavar="N",
+        help="keep at most N results per domain before fetching, so one "
+        "SEO/affiliate site can't monopolize the fetched sources",
+    )
     rs.add_argument("--timeout", type=int, default=20, help="fetch timeout seconds")
     rs.add_argument(
         "--max-chars",
         type=int,
         default=2500,
         help="truncate each fetched body to N chars (default: 2500)",
+    )
+    rs.add_argument(
+        "--max-total-chars",
+        type=int,
+        default=None,
+        metavar="N",
+        help="cap total fetched-content size for the whole run; the budget "
+        "is split evenly across fetched sources (per-source floor 600). "
+        "Useful for keeping research output within an agent token budget.",
     )
     rs.add_argument("--skip-chars", type=int, default=0)
     rs.add_argument(
@@ -1259,6 +1405,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_body_args(rs)
     _add_rerank_args(rs)
     _add_proxy_arg(rs)
+    _add_searxng_arg(rs)
     _add_cache_args(rs)
     # Research defaults: favor clean sources out of the box
     rs.set_defaults(func=cmd_research, trust="medium")
@@ -1383,9 +1530,25 @@ def build_parser() -> argparse.ArgumentParser:
     rp_sub = rp.add_subparsers(dest="action", required=True)
     rp_ex = rp_sub.add_parser("explain", help="explain why a URL is kept/dropped/boosted")
     rp_ex.add_argument("url")
-    rp_ls = rp_sub.add_parser("list", help="list trusted allowlists")
+    rp_ls = rp_sub.add_parser("list", help="list trusted allowlists + user lists")
     rp_ls.add_argument("--category", default=None, choices=list(reputation.TRUSTED.keys()))
+    for _act, _help in (
+        ("block", "add a domain to the persistent user blocklist"),
+        ("allow", "add a domain to the persistent user allowlist"),
+        ("unblock", "remove a domain from the user blocklist"),
+        ("unallow", "remove a domain from the user allowlist"),
+    ):
+        _p = rp_sub.add_parser(_act, help=_help)
+        _p.add_argument("domain", help="domain or URL (host is extracted)")
     rp.set_defaults(func=cmd_reputation)
+
+    # mcp — run as an MCP stdio server
+    mp = sub.add_parser(
+        "mcp",
+        help="Run as an MCP stdio server (exposes search/fetch/research as "
+        "MCP tools). Register with: claude mcp add websearch -- websearch mcp",
+    )
+    mp.set_defaults(func=cmd_mcp)
 
     return p
 

@@ -5,12 +5,16 @@ import json
 import os
 import random
 import re
+import shutil
+import socket
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
 from typing import Callable, Iterable, Optional
-from urllib.parse import quote_plus, unquote, urljoin, urlparse
+from urllib.parse import quote_plus, unquote, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -67,6 +71,91 @@ def _proxies(proxy: Optional[str] = None) -> Optional[dict]:
     if not p:
         return None
     return {"http": p, "https": p}
+
+
+def proxy_reachable(proxy: Optional[str] = None, timeout: float = 2.0) -> Optional[bool]:
+    """TCP-connect probe of a configured proxy's host:port.
+
+    Returns True/False when a proxy is configured (explicit arg or
+    $WEBSEARCH_PROXY), or None when no proxy is set. Lets callers warn
+    loudly when a proxy is configured but dead, instead of silently
+    falling back to direct fetches.
+    """
+    p = proxy or os.environ.get("WEBSEARCH_PROXY")
+    if not p:
+        return None
+    try:
+        parsed = urlparse(p)
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port or (1080 if "socks" in (parsed.scheme or "") else 8080)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+_TABLE_LINE_RE = re.compile(r"^\s*\|")
+_SENTENCE_ENDS = (". ", ".\n", "。", "! ", "? ", "!\n", "?\n")
+
+
+def smart_truncate(text: str, max_chars: Optional[int]) -> str:
+    """Truncate `text` to ~`max_chars`, at a clean boundary, never mid-table.
+
+    Boundary preference: paragraph break > sentence end > line break > hard
+    cut. A markdown table that *starts* within budget is kept whole even if
+    that pushes slightly over `max_chars`; a table the cut would land inside
+    but which started past budget is dropped entirely rather than shown
+    headless.
+    """
+    if not max_chars or len(text) <= max_chars:
+        return text
+
+    lines = text.split("\n")
+    offsets: list[int] = []
+    pos = 0
+    for ln in lines:
+        offsets.append(pos)
+        pos += len(ln) + 1  # +1 for the newline
+
+    # Contiguous markdown-table blocks as (start_char, end_char).
+    blocks: list[tuple[int, int]] = []
+    i = 0
+    while i < len(lines):
+        if _TABLE_LINE_RE.match(lines[i]):
+            j = i
+            while j < len(lines) and _TABLE_LINE_RE.match(lines[j]):
+                j += 1
+            blocks.append((offsets[i], offsets[j - 1] + len(lines[j - 1])))
+            i = j
+        else:
+            i += 1
+
+    cut = max_chars
+    extended_for_table = False
+    for start, end in blocks:
+        if start < cut < end:
+            # Keep the table whole if it began within budget; else drop it.
+            cut = end if start < max_chars else start
+            extended_for_table = cut > max_chars
+            break
+
+    if not extended_for_table:
+        window = text[:cut]
+        # Tiered floors: a paragraph break is the cleanest cut so we accept
+        # it earlier; a bare newline must be close to budget to be worth it.
+        para = window.rfind("\n\n")
+        sent = max(window.rfind(s) for s in _SENTENCE_ENDS)
+        nl = window.rfind("\n")
+        if para >= int(max_chars * 0.5):
+            cut = para
+        elif sent >= int(max_chars * 0.6):
+            cut = sent + 1  # keep the punctuation
+        elif nl >= int(max_chars * 0.75):
+            cut = nl
+
+    return text[:cut].rstrip() + f"\n\n... [truncated at ~{max_chars} chars, clean boundary]"
 
 
 # A module-level Session reuses connections and cookies across calls
@@ -593,9 +682,7 @@ def html_to_text(
     text = re.sub(r"\n{3,}", "\n\n", text)
     if skip_chars and skip_chars < len(text):
         text = text[skip_chars:]
-    if max_chars and len(text) > max_chars:
-        text = text[:max_chars] + f"\n\n... [truncated at {max_chars} chars]"
-    return text
+    return smart_truncate(text, max_chars)
 
 
 def grep_lines(
@@ -824,6 +911,203 @@ def search_bing(
     return results[:max_results]
 
 
+_SEARXNG_TIME_RANGE = {"d": "day", "w": "week", "m": "month", "y": "year"}
+
+
+def _since_to_searxng_range(since: Optional[str]) -> Optional[str]:
+    """Map a --since value to a SearXNG time_range bucket (best-effort).
+
+    SearXNG only offers coarse day/week/month/year buckets; precise dates
+    are left to the post-fetch --enforce-since check.
+    """
+    if not since:
+        return None
+    s = since.strip().lower()
+    return _SEARXNG_TIME_RANGE.get(s)
+
+
+# --- SearXNG autostart: bring a local instance up on demand --------------
+_searxng_lock = threading.Lock()
+
+
+def _searxng_endpoint(url: str) -> tuple[Optional[str], int]:
+    p = urlparse(url)
+    return p.hostname, (p.port or (443 if p.scheme == "https" else 80))
+
+
+def _local_host(url: str) -> bool:
+    """True if `url`'s host is this machine — autostart only ever touches a
+    local instance, never a remote one."""
+    host, _ = _searxng_endpoint(url)
+    return (host or "").lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+
+def searxng_reachable(url: str, timeout: float = 2.0) -> bool:
+    """TCP-probe a SearXNG URL's host:port. Cheap, and immune to any SOCKS
+    proxy that would otherwise hijack a localhost HTTP request."""
+    host, port = _searxng_endpoint(url)
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _find_docker() -> Optional[str]:
+    return shutil.which("docker") or next(
+        (p for p in ("/usr/local/bin/docker", "/opt/homebrew/bin/docker")
+         if os.path.exists(p)),
+        None,
+    )
+
+
+def _docker_running(docker: str) -> bool:
+    try:
+        r = subprocess.run(
+            [docker, "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, timeout=12,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _searxng_start_cmd(docker: str, autostart: str) -> list[str]:
+    """Resolve the autostart spec to a docker command. A path to an existing
+    file → `docker compose -f <path> up -d`; anything else → treat it as a
+    container name and `docker start <name>`."""
+    path = os.path.expanduser(autostart)
+    if os.path.isfile(path):
+        return [docker, "compose", "-f", path, "up", "-d"]
+    return [docker, "start", autostart]
+
+
+def ensure_searxng(
+    url: str,
+    autostart: Optional[str],
+    *,
+    log: Optional[Callable[[str], None]] = None,
+    ready_timeout: float = 45.0,
+) -> bool:
+    """Make a local SearXNG instance reachable, starting it if needed.
+
+    Returns True if SearXNG responds (already up, or up after we started it).
+    Returns False — so the caller falls back to DuckDuckGo/Bing — when the
+    instance is remote, `autostart` is unset, or the start attempt fails.
+
+    `autostart` is a docker-compose file path or a container name (see
+    `_searxng_start_cmd`). Thread-safe: concurrent callers (e.g. parallel
+    `search_many` queries) serialize on a lock so the container is started
+    once, not N times.
+    """
+    log = log or (lambda m: print(m, file=sys.stderr))
+    if searxng_reachable(url):
+        return True
+    if not autostart or not _local_host(url):
+        return False
+
+    with _searxng_lock:
+        # Another thread may have started it while we waited for the lock.
+        if searxng_reachable(url):
+            return True
+        docker = _find_docker()
+        if not docker:
+            log("websearch: SearXNG is down and `docker` was not found — "
+                "using DuckDuckGo/Bing.")
+            return False
+        if not _docker_running(docker):
+            log("websearch: Docker is not running — launching Docker Desktop "
+                "(this can take ~60s)...")
+            try:
+                subprocess.run(["open", "-a", "Docker"],
+                               capture_output=True, timeout=15)
+            except Exception:
+                pass
+            deadline = time.time() + 75
+            while time.time() < deadline and not _docker_running(docker):
+                time.sleep(3)
+            if not _docker_running(docker):
+                log("websearch: Docker did not come up — using DuckDuckGo/Bing.")
+                return False
+        cmd = _searxng_start_cmd(docker, autostart)
+        log("websearch: local SearXNG is down — starting it "
+            f"({' '.join(cmd[1:])})...")
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=90)
+        except Exception as e:  # noqa: BLE001
+            log(f"websearch: failed to start SearXNG ({e}) — using DuckDuckGo/Bing.")
+            return False
+        deadline = time.time() + ready_timeout
+        while time.time() < deadline:
+            if searxng_reachable(url):
+                log("websearch: local SearXNG is up.")
+                return True
+            time.sleep(2)
+        log("websearch: SearXNG did not become ready in time — "
+            "using DuckDuckGo/Bing.")
+        return False
+
+
+def search_searxng(
+    query: str,
+    base: str,
+    max_results: int = 10,
+    timeout: int = 20,
+    proxy: Optional[str] = None,
+    exclude: Optional[list[str]] = None,
+    since: Optional[str] = None,
+    trust: str = "any",
+    prefer: Optional[str] = None,
+) -> list[SearchResult]:
+    """Query a SearXNG instance's JSON API.
+
+    `base` is the instance root URL (e.g. http://192.168.50.x:8080). The
+    instance must have the `json` output format enabled in settings.yml
+    (`search.formats`) — otherwise it returns HTML and we raise so the
+    caller falls back to the next engine.
+    """
+    base = base.rstrip("/")
+    params = {"q": query, "format": "json"}
+    tr = _since_to_searxng_range(since)
+    if tr:
+        params["time_range"] = tr
+    url = f"{base}/search?{urlencode(params)}"
+    try:
+        r = _do_request("GET", url, timeout, proxy)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"SearXNG request failed: {e}") from e
+
+    if "json" not in (r.headers.get("Content-Type", "") or "").lower():
+        raise RuntimeError(
+            "SearXNG did not return JSON — enable the 'json' format under "
+            "search.formats in the instance settings.yml"
+        )
+    try:
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"SearXNG JSON parse failed: {e}") from e
+
+    results: list[SearchResult] = []
+    for i, item in enumerate(data.get("results", []) or [], start=1):
+        u = item.get("url", "")
+        if not u:
+            continue
+        results.append(
+            SearchResult(
+                rank=i,
+                title=item.get("title", "") or "",
+                url=u,
+                snippet=item.get("content", "") or "",
+            )
+        )
+    results = _filter_excluded(results, exclude)
+    results = reputation.filter_and_rank(results, trust=trust, prefer=prefer)
+    return results[:max_results]
+
+
 def search_smart(
     query: str,
     max_results: int = 10,
@@ -832,26 +1116,42 @@ def search_smart(
     since: Optional[str] = None,
     trust: str = "any",
     prefer: Optional[str] = None,
+    searxng: Optional[str] = None,
+    searxng_autostart: Optional[str] = None,
 ) -> tuple[str, list[SearchResult]]:
-    """Try DuckDuckGo first, then Bing.
+    """Try SearXNG (if configured), then DuckDuckGo, then Bing.
 
     A genuine empty-results return from one engine is treated as a successful
     search, not an error — we still try the next engine in case it has results,
-    but we won't fail loudly if both legitimately return zero.
+    but we won't fail loudly if all legitimately return zero.
+
+    `searxng` is the instance URL; falls back to $WEBSEARCH_SEARXNG. When set,
+    it is tried first — a self-hosted instance is more stable than scraping.
+
+    `searxng_autostart` (falls back to $WEBSEARCH_SEARXNG_AUTOSTART) is a
+    docker-compose file path or container name; when set and a local SearXNG
+    is down, websearch starts it before querying.
     """
     errors: list[EngineError] = []
     saw_empty = False
-    for engine_name, engine in (("duckduckgo", search_duckduckgo), ("bing", search_bing)):
+    common = dict(
+        max_results=max_results, proxy=proxy, exclude=exclude,
+        since=since, trust=trust, prefer=prefer,
+    )
+    engines: list[tuple[str, Callable[[], list[SearchResult]]]] = []
+    sx = searxng or os.environ.get("WEBSEARCH_SEARXNG")
+    if sx:
+        autostart = searxng_autostart or os.environ.get("WEBSEARCH_SEARXNG_AUTOSTART")
+        if autostart and not ensure_searxng(sx, autostart):
+            sx = None  # could not bring it up — skip, fall through to DDG/Bing
+    if sx:
+        engines.append(("searxng", lambda: search_searxng(query, sx, **common)))
+    engines.append(("duckduckgo", lambda: search_duckduckgo(query, **common)))
+    engines.append(("bing", lambda: search_bing(query, **common)))
+
+    for engine_name, engine in engines:
         try:
-            results = engine(
-                query,
-                max_results=max_results,
-                proxy=proxy,
-                exclude=exclude,
-                since=since,
-                trust=trust,
-                prefer=prefer,
-            )
+            results = engine()
             if results:
                 return engine_name, results
             saw_empty = True  # legitimate empty
@@ -859,7 +1159,7 @@ def search_smart(
             errors.append(EngineError(engine_name, str(e)))
             time.sleep(0.5)
     if saw_empty and not errors:
-        return "duckduckgo", []  # genuinely no hits anywhere
+        return engines[0][0], []  # genuinely no hits anywhere
     detail = "; ".join(f"{e.engine}: {e.error}" for e in errors)
     raise RuntimeError(f"all search engines failed: {detail}")
 
@@ -874,6 +1174,8 @@ def search_many(
     since: Optional[str] = None,
     trust: str = "any",
     prefer: Optional[str] = None,
+    searxng: Optional[str] = None,
+    searxng_autostart: Optional[str] = None,
 ) -> dict:
     """Run multiple search queries in parallel and return combined results.
 
@@ -894,6 +1196,8 @@ def search_many(
                 since=since,
                 trust=trust,
                 prefer=prefer,
+                searxng=searxng,
+                searxng_autostart=searxng_autostart,
             ): q
             for q in queries
         }

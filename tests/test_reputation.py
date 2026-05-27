@@ -32,6 +32,76 @@ def test_score_seo_url_pattern_penalty():
     assert reputation.score("https://random.example/buyers-roadmap") == -2
 
 
+def test_score_text_param_optional_and_backward_compatible():
+    # url-only callers are unchanged: no text -> no affiliate penalty.
+    assert reputation.score("https://random.example/article") == 0
+
+
+def test_score_affiliate_text_penalty():
+    aff = "This post may contain affiliate links. We may earn a commission."
+    assert reputation.score("https://random.example/article", aff) == -3
+    # Clean text -> no penalty.
+    assert reputation.score("https://random.example/article", "plain prose") == 0
+
+
+def test_looks_affiliate_detects_signals():
+    assert reputation.looks_affiliate("at no extra cost to you")
+    assert reputation.looks_affiliate("Best CBD Oils of 2026")
+    assert reputation.looks_affiliate("use our discount code")
+    assert not reputation.looks_affiliate("a neutral encyclopedia article")
+    assert not reputation.looks_affiliate("")
+
+
+def test_filter_and_rank_demotes_affiliate_snippet():
+    results = [
+        _R(1, "Affiliate blog", "https://blog.example/x",
+           "This page may contain affiliate links."),
+        _R(2, "Neutral page", "https://other.example/y", "plain summary"),
+    ]
+    ranked = reputation.filter_and_rank(results, trust="medium")
+    # Both survive medium trust, but the neutral page ranks above the
+    # affiliate one after the -3 penalty.
+    assert ranked[0].url == "https://other.example/y"
+
+
+def test_cap_per_domain_limits_and_reranks():
+    results = [
+        _R(1, "a1", "https://spam.example/1"),
+        _R(2, "a2", "https://spam.example/2"),
+        _R(3, "a3", "https://spam.example/3"),
+        _R(4, "b1", "https://other.example/1"),
+    ]
+    capped = reputation.cap_per_domain(results, 2)
+    assert [r.url for r in capped] == [
+        "https://spam.example/1",
+        "https://spam.example/2",
+        "https://other.example/1",
+    ]
+    assert [r.rank for r in capped] == [1, 2, 3]
+
+
+def test_user_block_allow_lists_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(reputation, "USER_CONFIG_DIR", tmp_path)
+    reputation._user_cache.clear()
+
+    # Unknown domain is neutral.
+    assert reputation.score("https://random.example/x") == 0
+
+    reputation.edit_user_list("block", "random.example")
+    assert reputation.score("https://random.example/x") == -10
+    # Subdomain also caught.
+    assert reputation.score("https://sub.random.example/x") == -10
+
+    reputation.edit_user_list("allow", "goodsite.example")
+    assert reputation.score("https://goodsite.example/x") == 3
+
+    # Removal restores neutrality.
+    reputation.edit_user_list("block", "random.example", remove=True)
+    assert reputation.score("https://random.example/x") == 0
+
+    reputation._user_cache.clear()
+
+
 def test_category_of_distinguishes_categories():
     assert reputation.category_of("nature.com") == "academic"
     assert reputation.category_of("cdc.gov") == "gov"

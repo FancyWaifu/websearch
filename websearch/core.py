@@ -1274,6 +1274,253 @@ def search_searxng(
     return results[:max_results]
 
 
+_BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+
+def search_brave(
+    query: str,
+    max_results: int = 10,
+    timeout: int = 20,
+    proxy: Optional[str] = None,
+    exclude: Optional[list[str]] = None,
+    since: Optional[str] = None,
+    trust: str = "any",
+    prefer: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> list[SearchResult]:
+    """Query the Brave Search API.
+
+    Brave runs an independent search index (not a Google/Bing skin); the
+    free tier is 1 query/sec, 2000/month. The API key comes from
+    https://api.search.brave.com/app/keys — pass via `api_key`, or set
+    $WEBSEARCH_BRAVE_KEY. Raises if no key is configured (caller in
+    search_smart will skip this backend in that case).
+    """
+    key = api_key or os.environ.get("WEBSEARCH_BRAVE_KEY")
+    if not key:
+        raise RuntimeError("Brave Search needs $WEBSEARCH_BRAVE_KEY (free tier: "
+                           "https://api.search.brave.com/app/keys)")
+    params: dict[str, str | int] = {
+        "q": query,
+        "count": min(max_results, 20),  # Brave caps at 20 per request
+        "safesearch": "off",
+    }
+    # Brave's freshness param maps onto our --since values.
+    freshness = _since_to_brave_freshness(since)
+    if freshness:
+        params["freshness"] = freshness
+    # Brave needs custom headers (X-Subscription-Token) that _do_request
+    # doesn't take, so use the session directly.
+    try:
+        r = session().get(
+            _BRAVE_SEARCH_ENDPOINT,
+            params=params,
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": key,
+            },
+            timeout=timeout,
+            proxies=_proxies(proxy),
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Brave Search request failed: {e}") from e
+    try:
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Brave Search JSON parse failed: {e}") from e
+    web_hits = (data.get("web") or {}).get("results") or []
+    results: list[SearchResult] = []
+    for i, item in enumerate(web_hits, start=1):
+        u = item.get("url", "")
+        if not u or _is_ad_redirect(u):
+            continue
+        results.append(SearchResult(
+            rank=i,
+            title=item.get("title", "") or "",
+            url=u,
+            snippet=item.get("description", "") or "",
+        ))
+    results = _filter_excluded(results, exclude)
+    results = reputation.filter_and_rank(results, trust=trust, prefer=prefer)
+    return results[:max_results]
+
+
+_BRAVE_FRESHNESS = {"d": "pd", "w": "pw", "m": "pm", "y": "py"}
+
+
+def _since_to_brave_freshness(since: Optional[str]) -> Optional[str]:
+    """Map --since values to Brave's freshness param (pd/pw/pm/py = past
+    day/week/month/year). Date-form values pass through as YYYY-MM-DDtoYYYY-MM-DD."""
+    if not since:
+        return None
+    s = since.strip().lower()
+    if s in _BRAVE_FRESHNESS:
+        return _BRAVE_FRESHNESS[s]
+    # YYYY-MM-DD passthrough: Brave accepts an absolute date range like
+    # 2024-01-01to2026-12-31. For a single since-date we pair it with "today".
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        return f"{s}to{today}"
+    return None
+
+
+_TAVILY_ENDPOINT = "https://api.tavily.com/search"
+_EXA_ENDPOINT = "https://api.exa.ai/search"
+
+
+def search_tavily(
+    query: str,
+    max_results: int = 10,
+    timeout: int = 30,
+    proxy: Optional[str] = None,
+    exclude: Optional[list[str]] = None,
+    since: Optional[str] = None,
+    trust: str = "any",
+    prefer: Optional[str] = None,
+    api_key: Optional[str] = None,
+    search_depth: str = "basic",
+) -> list[SearchResult]:
+    """Query the Tavily Search API — an AI-native search engine that
+    returns relevance-ranked results designed for LLM consumption.
+
+    Key via `api_key` or $WEBSEARCH_TAVILY_KEY. Paid product with free
+    tier (1000 calls/month at time of writing). `search_depth='advanced'`
+    pulls more sources per query at higher cost; 'basic' is the default.
+    """
+    key = api_key or os.environ.get("WEBSEARCH_TAVILY_KEY")
+    if not key:
+        raise RuntimeError("Tavily needs $WEBSEARCH_TAVILY_KEY (signup: "
+                           "https://app.tavily.com)")
+    payload: dict = {
+        "api_key": key,
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": min(max_results, 20),
+        "include_answer": False,  # we do our own synthesis downstream
+    }
+    if exclude:
+        payload["exclude_domains"] = list(exclude)
+    try:
+        r = session().post(
+            _TAVILY_ENDPOINT,
+            json=payload,
+            timeout=timeout,
+            proxies=_proxies(proxy),
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Tavily request failed: {e}") from e
+    try:
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Tavily JSON parse failed: {e}") from e
+    results: list[SearchResult] = []
+    for i, item in enumerate(data.get("results", []) or [], start=1):
+        u = item.get("url", "")
+        if not u or _is_ad_redirect(u):
+            continue
+        results.append(SearchResult(
+            rank=i,
+            title=item.get("title", "") or "",
+            url=u,
+            snippet=item.get("content", "") or "",
+        ))
+    results = reputation.filter_and_rank(results, trust=trust, prefer=prefer)
+    return results[:max_results]
+
+
+def search_exa(
+    query: str,
+    max_results: int = 10,
+    timeout: int = 30,
+    proxy: Optional[str] = None,
+    exclude: Optional[list[str]] = None,
+    since: Optional[str] = None,
+    trust: str = "any",
+    prefer: Optional[str] = None,
+    api_key: Optional[str] = None,
+    search_type: str = "auto",
+) -> list[SearchResult]:
+    """Query the Exa Search API — neural (embedding-based) web search.
+    Strong for "find pages similar to X" and semantic phrasing where
+    keyword search misses.
+
+    Key via `api_key` or $WEBSEARCH_EXA_KEY. `search_type` is 'auto'
+    (Exa chooses), 'neural' (semantic), or 'keyword'. Free tier
+    available; paid for higher volume.
+    """
+    key = api_key or os.environ.get("WEBSEARCH_EXA_KEY")
+    if not key:
+        raise RuntimeError("Exa needs $WEBSEARCH_EXA_KEY (signup: "
+                           "https://dashboard.exa.ai)")
+    payload: dict = {
+        "query": query,
+        "type": search_type,
+        "numResults": min(max_results, 20),
+    }
+    if exclude:
+        payload["excludeDomains"] = list(exclude)
+    if since:
+        # Exa wants ISO timestamps. Map shorthand to absolute dates.
+        date = _since_to_iso_date(since)
+        if date:
+            payload["startPublishedDate"] = date
+    try:
+        r = session().post(
+            _EXA_ENDPOINT,
+            json=payload,
+            headers={"x-api-key": key, "Accept": "application/json"},
+            timeout=timeout,
+            proxies=_proxies(proxy),
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Exa request failed: {e}") from e
+    try:
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Exa JSON parse failed: {e}") from e
+    results: list[SearchResult] = []
+    for i, item in enumerate(data.get("results", []) or [], start=1):
+        u = item.get("url", "")
+        if not u or _is_ad_redirect(u):
+            continue
+        # Exa returns `text` (full doc) and `highlights` (snippets) when
+        # requested. Default is title-only — use highlights if present,
+        # else fall through to title-derived snippet.
+        snippet = item.get("text") or ""
+        if not snippet and item.get("highlights"):
+            snippet = " ... ".join(item["highlights"])
+        snippet = snippet[:500]
+        results.append(SearchResult(
+            rank=i,
+            title=item.get("title", "") or "",
+            url=u,
+            snippet=snippet,
+        ))
+    results = reputation.filter_and_rank(results, trust=trust, prefer=prefer)
+    return results[:max_results]
+
+
+def _since_to_iso_date(since: str) -> Optional[str]:
+    """Convert shorthand (d/w/m/y) or YYYY-MM-DD to an ISO-8601 datetime
+    string suitable for Exa's startPublishedDate."""
+    if not since:
+        return None
+    s = since.strip().lower()
+    import datetime as _dt
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return f"{s}T00:00:00.000Z"
+    deltas = {"d": 1, "w": 7, "m": 30, "y": 365}
+    if s in deltas:
+        d = _dt.date.today() - _dt.timedelta(days=deltas[s])
+        return f"{d.isoformat()}T00:00:00.000Z"
+    return None
+
+
 def search_smart(
     query: str,
     max_results: int = 10,
@@ -1284,6 +1531,8 @@ def search_smart(
     prefer: Optional[str] = None,
     searxng: Optional[str] = None,
     searxng_autostart: Optional[str] = None,
+    brave_key: Optional[str] = None,
+    backend: Optional[str] = None,
 ) -> tuple[str, list[SearchResult]]:
     """Try SearXNG (if configured), then DuckDuckGo, then Bing.
 
@@ -1304,6 +1553,16 @@ def search_smart(
         max_results=max_results, proxy=proxy, exclude=exclude,
         since=since, trust=trust, prefer=prefer,
     )
+
+    # Explicit backend override: when the caller passed --backend tavily|exa
+    # they want THAT engine, not the fallback chain. Skip the auto-chain.
+    if backend == "tavily":
+        return "tavily", search_tavily(query, **common)
+    if backend == "exa":
+        return "exa", search_exa(query, **common)
+    if backend == "brave":
+        return "brave", search_brave(query, **common)
+
     engines: list[tuple[str, Callable[[], list[SearchResult]]]] = []
     sx = searxng or os.environ.get("WEBSEARCH_SEARXNG")
     if sx:
@@ -1312,6 +1571,13 @@ def search_smart(
             sx = None  # could not bring it up — skip, fall through to DDG/Bing
     if sx:
         engines.append(("searxng", lambda: search_searxng(query, sx, **common)))
+    # Brave Search API: independent index, free tier 2000q/month, licensed
+    # results — preferable to scraping when a key is configured. Slot it
+    # between SearXNG (which proxies many engines) and DDG/Bing scraping
+    # so a degraded SearXNG instance gets a clean fallback.
+    bkey = brave_key or os.environ.get("WEBSEARCH_BRAVE_KEY")
+    if bkey:
+        engines.append(("brave", lambda: search_brave(query, api_key=bkey, **common)))
     engines.append(("duckduckgo", lambda: search_duckduckgo(query, **common)))
     engines.append(("bing", lambda: search_bing(query, **common)))
 
@@ -1378,6 +1644,8 @@ def search_many(
     prefer: Optional[str] = None,
     searxng: Optional[str] = None,
     searxng_autostart: Optional[str] = None,
+    brave_key: Optional[str] = None,
+    backend: Optional[str] = None,
 ) -> dict:
     """Run multiple search queries in parallel and return combined results.
 
@@ -1400,6 +1668,8 @@ def search_many(
                 prefer=prefer,
                 searxng=searxng,
                 searxng_autostart=searxng_autostart,
+                brave_key=brave_key,
+                backend=backend,
             ): q
             for q in queries
         }

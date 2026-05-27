@@ -79,6 +79,23 @@ def _add_searxng_arg(p: argparse.ArgumentParser) -> None:
         "a docker-compose file path or a container name. Falls back to "
         "$WEBSEARCH_SEARXNG_AUTOSTART.",
     )
+    p.add_argument(
+        "--brave-key",
+        default=None,
+        metavar="KEY",
+        help="Brave Search API key. If set (or $WEBSEARCH_BRAVE_KEY), Brave "
+        "is tried after SearXNG and before DDG/Bing scraping. Free tier "
+        "available at https://api.search.brave.com/app/keys.",
+    )
+    p.add_argument(
+        "--backend",
+        choices=["auto", "searxng", "brave", "tavily", "exa", "duckduckgo", "bing"],
+        default="auto",
+        help="force a specific search backend instead of the auto-fallback "
+        "chain. 'tavily' and 'exa' are AI-native paid APIs ($WEBSEARCH_"
+        "TAVILY_KEY / $WEBSEARCH_EXA_KEY); auto (default) uses SearXNG -> "
+        "Brave -> DDG -> Bing.",
+    )
 
 
 def _add_cache_args(p: argparse.ArgumentParser) -> None:
@@ -207,6 +224,14 @@ def _warn_if_empty(report: dict, args: argparse.Namespace, queries: list[str]) -
         msg.append(f"  - {n_raw} raw result(s) were dropped by filters "
                    "(--trust / --exclude / --require / reputation block).")
     print("\n".join(msg), file=sys.stderr)
+
+
+def _resolve_backend(args: argparse.Namespace) -> Optional[str]:
+    """Translate the --backend argparse value into what search_smart wants.
+    'auto' means 'use the fallback chain' which is the function's default
+    (None), so we map that to None instead of the literal string 'auto'."""
+    b = getattr(args, "backend", None)
+    return None if b in (None, "auto") else b
 
 
 def _enforce_since(fetched: list, since: str) -> list:
@@ -505,6 +530,8 @@ def cmd_search(args: argparse.Namespace) -> int:
             exclude=exclude or None,
             searxng=args.searxng,
             searxng_autostart=args.searxng_autostart,
+            brave_key=getattr(args, "brave_key", None),
+            backend=_resolve_backend(args),
             **filter_kwargs,
         )
         _apply_rerank_pipeline(report, queries[0], require_terms, do_rerank)
@@ -534,6 +561,8 @@ def cmd_search(args: argparse.Namespace) -> int:
             engine, results = search_smart(
                 query, max_results=args.max, proxy=proxy, exclude=excl,
                 searxng=args.searxng, searxng_autostart=args.searxng_autostart,
+                brave_key=getattr(args, "brave_key", None),
+                backend=_resolve_backend(args),
                 **filter_kwargs,
             )
         elif args.engine == "ddg":
@@ -708,6 +737,8 @@ def cmd_research(args: argparse.Namespace) -> int:
         prefer=args.prefer,
         searxng=args.searxng,
         searxng_autostart=args.searxng_autostart,
+        brave_key=getattr(args, "brave_key", None),
+        backend=_resolve_backend(args),
     )
 
     _apply_rerank_pipeline(report, queries[0], require_terms, args.rerank)

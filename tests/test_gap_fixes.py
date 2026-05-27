@@ -180,6 +180,23 @@ def test_demote_missing_terms_preserves_order_within_buckets():
     assert [r["url"] for r in out] == ["a", "c", "b", "d"]
 
 
+def test_rerank_vector_degrades_to_tfidf_when_dep_missing(monkeypatch):
+    """When sentence-transformers isn't installed, rerank_vector should
+    transparently fall back to TF-IDF instead of crashing. The CLI also
+    prints a one-time warning; here we just verify the function path."""
+    from websearch import rerank as _rerank
+    monkeypatch.setattr(_rerank, "have_sentence_transformers", lambda: False)
+    results = [
+        {"url": "a", "title": "talks about X", "snippet": "X X X"},
+        {"url": "b", "title": "unrelated", "snippet": "Y Y Y"},
+    ]
+    out = _rerank.rerank_vector(results, "X")
+    # TF-IDF rerank ranks the X-heavy doc first; we only need to verify
+    # that the call returned a list and reranked (didn't crash).
+    assert len(out) == 2
+    assert out[0]["url"] == "a"
+
+
 def test_demote_missing_terms_is_case_insensitive_and_safe_on_empty():
     assert demote_missing_terms([]) == []
     # Lower-cased variant should still match.

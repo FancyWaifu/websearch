@@ -35,6 +35,14 @@ def _have_faster_whisper() -> bool:
         return False
 
 
+def _have_sentence_transformers() -> bool:
+    try:
+        import sentence_transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _yt_dlp_info() -> dict:
     """yt-dlp availability + version + age in one place."""
     path = shutil.which("yt-dlp")
@@ -339,6 +347,11 @@ def report(proxy: Optional[str] = None) -> dict:
             "available": _have_faster_whisper(),
             "model": os.environ.get("WEBSEARCH_WHISPER_MODEL", "small"),
         },
+        "sentence_transformers": {
+            "available": _have_sentence_transformers(),
+            "model": os.environ.get("WEBSEARCH_EMBED_MODEL",
+                                    "sentence-transformers/all-MiniLM-L6-v2"),
+        },
         "yt_cookies_from": os.environ.get("WEBSEARCH_YT_COOKIES_FROM", ""),
     }
     try:
@@ -465,6 +478,11 @@ def format_human(rep: dict) -> str:
         tools.append(f"  whisper    : ok  (faster-whisper, model={fw.get('model','small')})")
     else:
         tools.append("  whisper    : missing (pipx inject websearch faster-whisper) — needed for --whisper on captionless YT")
+    st = rep.get("sentence_transformers", {})
+    if st.get("available"):
+        tools.append(f"  embed      : ok  (sentence-transformers, model={st.get('model')})")
+    else:
+        tools.append("  embed      : missing (pipx inject websearch sentence-transformers) — needed for --rerank-vector; falls back to TF-IDF when missing")
     lines.append("")
     lines.append("External tools:")
     lines.extend(tools)

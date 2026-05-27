@@ -15,6 +15,7 @@ dev = ["pytest>=7"]
 mcp = ["mcp>=1.2"]
 youtube = ["youtube-transcript-api>=0.6"]
 whisper = ["faster-whisper>=1.0"]
+embed = ["sentence-transformers>=3.0"]
 # brave/tavily/exa use only `requests` (already a core dep), so no
 # extra package install needed — they're listed for discoverability:
 # `pip show websearch` shows what optional backends exist.

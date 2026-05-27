@@ -181,6 +181,16 @@ def _add_rerank_args(p: argparse.ArgumentParser) -> None:
         "primary query. Cheap, no model dependency.",
     )
     p.add_argument(
+        "--rerank-vector",
+        action="store_true",
+        help="rerank by sentence-transformer cosine similarity (stronger "
+        "for paraphrased queries / synonyms). Needs the [embed] extra: "
+        "`pipx inject websearch sentence-transformers`. Model from "
+        "$WEBSEARCH_EMBED_MODEL (default 'all-MiniLM-L6-v2', ~90MB). "
+        "First call loads model (~5s); subsequent calls fast. If the "
+        "extra is missing, silently degrades to --rerank.",
+    )
+    p.add_argument(
         "--require",
         action="append",
         default=[],
@@ -554,7 +564,8 @@ def cmd_search(args: argparse.Namespace) -> int:
             backend=_resolve_backend(args),
             **filter_kwargs,
         )
-        _apply_rerank_pipeline(report, queries[0], require_terms, do_rerank)
+        _apply_rerank_pipeline(report, queries[0], require_terms, do_rerank,
+                               rerank_vector=getattr(args, "rerank_vector", False))
         if args.fetch_top and report.get("unique"):
             top_urls = [r["url"] for r in report["unique"][: args.fetch_top]]
             fetched = fetch_many(
@@ -654,11 +665,15 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def _apply_rerank_pipeline(
-    report: dict, primary_query: str, require_terms: list[str], do_rerank: bool
+    report: dict, primary_query: str, require_terms: list[str], do_rerank: bool,
+    rerank_vector: bool = False,
 ) -> dict:
-    """Cross-query boost → require-keyword filter → optional TF-IDF rerank.
+    """Cross-query boost → require-keyword filter → optional rerank.
 
-    Mutates `report['unique']` and re-ranks 1..N.
+    Mutates `report['unique']` and re-ranks 1..N. When `rerank_vector` is
+    true, uses sentence-transformer cosine similarity (stronger, slower,
+    needs the [embed] extra); otherwise falls back to TF-IDF when
+    `do_rerank` is set.
     """
     merged = report.get("unique", [])
     if not merged:
@@ -670,8 +685,18 @@ def _apply_rerank_pipeline(
         merged = _rerank.boost_by_query_count(report["queries"], merged)
     if require_terms:
         merged = _rerank.filter_required(merged, require_terms)
-    if do_rerank and primary_query:
-        merged = _rerank.rerank(merged, primary_query)
+    if primary_query:
+        if rerank_vector:
+            if not _rerank.have_sentence_transformers():
+                print("WARNING: --rerank-vector needs sentence-transformers; "
+                      "falling back to --rerank (TF-IDF). Install with: "
+                      "`pipx inject websearch sentence-transformers`",
+                      file=sys.stderr)
+                merged = _rerank.rerank(merged, primary_query)
+            else:
+                merged = _rerank.rerank_vector(merged, primary_query)
+        elif do_rerank:
+            merged = _rerank.rerank(merged, primary_query)
     report["unique"] = merged
     return report
 
@@ -761,7 +786,8 @@ def cmd_research(args: argparse.Namespace) -> int:
         backend=_resolve_backend(args),
     )
 
-    _apply_rerank_pipeline(report, queries[0], require_terms, args.rerank)
+    _apply_rerank_pipeline(report, queries[0], require_terms, args.rerank,
+                           rerank_vector=getattr(args, "rerank_vector", False))
     if args.max_per_domain and report.get("unique"):
         report["unique"] = reputation.cap_per_domain(
             report["unique"], args.max_per_domain

@@ -4,13 +4,19 @@ Pure stdlib (math + collections). Designed for tens-to-hundreds of search
 snippets, not for serious IR — but it fixes the common failure mode where
 the search engine matches a high-frequency phrase in the query and ignores
 the rare, defining terms.
+
+Also offers an optional `rerank_vector` powered by sentence-transformers
+when the [embed] extra is installed. Vector rerank is semantically
+stronger for paraphrased queries but pulls in PyTorch (~600MB+).
 """
 from __future__ import annotations
 
 import math
+import os
 import re
+import threading
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, Optional
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -84,6 +90,70 @@ def rerank(results: list[dict], query: str) -> list[dict]:
         return results
     scored = score_against_query(results, query)
     indexed = [(s, i, r) for i, (s, r) in enumerate(scored)]
+    indexed.sort(key=lambda x: (-x[0], x[1]))
+    out = [r for _, _, r in indexed]
+    for i, r in enumerate(out, start=1):
+        r["rank"] = i
+    return out
+
+
+_embed_model = None
+_embed_lock = threading.Lock()
+_DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def have_sentence_transformers() -> bool:
+    try:
+        import sentence_transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _get_embed_model():
+    """Lazy-load the embedding model the first time vector rerank is used.
+
+    First call takes ~5s (model load + small first inference) on M-series
+    CPU; subsequent calls are fast. Module-level lock ensures concurrent
+    callers don't each construct their own copy."""
+    global _embed_model
+    if _embed_model is not None:
+        return _embed_model
+    with _embed_lock:
+        if _embed_model is None:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            name = os.environ.get("WEBSEARCH_EMBED_MODEL", _DEFAULT_EMBED_MODEL)
+            _embed_model = SentenceTransformer(name)
+    return _embed_model
+
+
+def rerank_vector(results: list[dict], query: str) -> list[dict]:
+    """Reorder results by sentence-transformer cosine similarity.
+
+    Stronger than the TF-IDF rerank for paraphrased queries and synonyms
+    where the surface terms differ from the document's wording — the
+    classic "small/tiny/compact" case TF-IDF can't see. Falls back to
+    TF-IDF if sentence-transformers isn't installed (the caller can
+    decide whether to surface that as a warning).
+    """
+    if not results:
+        return results
+    if not have_sentence_transformers():
+        # Caller-visible signal: tag the results so the warning path can
+        # surface it, but don't crash — just degrade to TF-IDF.
+        return rerank(results, query)
+    model = _get_embed_model()
+    docs = [_doc_text(r) for r in results]
+    # Encode query + all docs in one batch (faster than per-doc calls).
+    # normalize_embeddings=True gives unit vectors so the cosine reduces
+    # to a dot product.
+    embeddings = model.encode([query] + docs, normalize_embeddings=True,
+                              show_progress_bar=False)
+    q_vec = embeddings[0]
+    indexed: list[tuple[float, int, dict]] = []
+    for i, (r, d_vec) in enumerate(zip(results, embeddings[1:])):
+        score = float(q_vec @ d_vec)
+        indexed.append((score, i, r))
     indexed.sort(key=lambda x: (-x[0], x[1]))
     out = [r for _, _, r in indexed]
     for i, r in enumerate(out, start=1):

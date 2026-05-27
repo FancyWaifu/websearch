@@ -136,4 +136,22 @@ def extract(body: bytes, max_pages: Optional[int] = None) -> str:
         if r.returncode != 0:
             err = r.stderr.decode("utf-8", errors="replace").strip()
             return f"[pdftotext failed (rc={r.returncode}): {err[:200]}]"
-        return r.stdout.decode("utf-8", errors="replace")
+        return _collapse_pdf_whitespace(r.stdout.decode("utf-8", errors="replace"))
+
+
+# pdftotext -layout preserves column padding so a centered abstract on a
+# two-column paper arrives with 40-80 leading spaces per line. That used to
+# eat a large fraction of any --max-chars budget without adding information.
+# Strip per-line leading runs of 4+ spaces, then collapse runs of inline
+# spaces to a single space. Single/double leading spaces (e.g. indented
+# code, tables) are left alone.
+_PDF_LEADING_RUN_RE = _re.compile(r"^[ \t]{4,}", _re.MULTILINE)
+_PDF_INLINE_RUN_RE = _re.compile(r"[ \t]{3,}")
+
+
+def _collapse_pdf_whitespace(text: str) -> str:
+    if not text:
+        return text
+    text = _PDF_LEADING_RUN_RE.sub("", text)
+    text = _PDF_INLINE_RUN_RE.sub(" ", text)
+    return text

@@ -16,6 +16,14 @@ from typing import Optional
 from urllib.parse import urlparse
 
 
+def _have_yt_api() -> bool:
+    try:
+        import youtube_transcript_api  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _path_entries() -> list[str]:
     return [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
 
@@ -67,6 +75,72 @@ def proxy_status(proxy: Optional[str] = None) -> dict:
     return out
 
 
+def searxng_status(searxng_url: Optional[str] = None) -> dict:
+    """Check whether SearXNG is configured and serving JSON.
+
+    SearXNG is `search_smart`'s first-choice backend, but it's also the
+    most likely thing to be misconfigured — env vars don't propagate to
+    non-interactive shells, the instance can be down, or its `json` format
+    can be disabled in settings.yml. `doctor` would silently leave the
+    user thinking results are degraded when really the primary engine
+    isn't being hit at all.
+    """
+    import requests
+
+    url = searxng_url or os.environ.get("WEBSEARCH_SEARXNG") or ""
+    autostart = os.environ.get("WEBSEARCH_SEARXNG_AUTOSTART") or ""
+    out: dict = {
+        "configured": bool(url),
+        "url": url,
+        "autostart": autostart,
+    }
+    if not url:
+        out["note"] = (
+            "No SearXNG set ($WEBSEARCH_SEARXNG unset, no --searxng) — "
+            "search falls back to DuckDuckGo/Bing scraping."
+        )
+        return out
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        out["host"] = host
+        out["port"] = port
+        with socket.create_connection((host, port), timeout=2):
+            pass
+        out["reachable"] = True
+    except (OSError, ValueError) as e:
+        out["reachable"] = False
+        out["error"] = str(e)
+        return out
+    try:
+        r = requests.get(
+            f"{url.rstrip('/')}/search",
+            params={"q": "websearch doctor probe", "format": "json"},
+            timeout=5,
+        )
+        out["http_status"] = r.status_code
+        ct = r.headers.get("Content-Type", "")
+        if "json" not in ct.lower():
+            out["json_format"] = False
+            out["error"] = (
+                f"instance returned Content-Type {ct!r} — enable the 'json' "
+                "format under search.formats in settings.yml"
+            )
+        else:
+            data = r.json()
+            out["json_format"] = True
+            out["result_count"] = len(data.get("results") or [])
+            unresp = data.get("unresponsive_engines") or []
+            if unresp:
+                out["unresponsive_engines"] = [
+                    f"{name} ({reason})" for name, reason in unresp
+                ]
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)
+    return out
+
+
 def report(proxy: Optional[str] = None) -> dict:
     """Collect everything into one structured dict."""
     from . import __version__
@@ -94,6 +168,7 @@ def report(proxy: Optional[str] = None) -> dict:
             "version": sys.version.split()[0],
         },
         "proxy": proxy_status(proxy),
+        "searxng": searxng_status(),
         "pdftotext": {
             "available": pdfx.have_pdftotext(),
             "path": shutil.which("pdftotext"),
@@ -102,6 +177,10 @@ def report(proxy: Optional[str] = None) -> dict:
             "available": shutil.which("yt-dlp") is not None,
             "path": shutil.which("yt-dlp"),
         },
+        "youtube_transcript_api": {
+            "available": _have_yt_api(),
+        },
+        "yt_cookies_from": os.environ.get("WEBSEARCH_YT_COOKIES_FROM", ""),
     }
     try:
         rep["cache"] = default_cache().stats()
@@ -140,11 +219,37 @@ def format_human(rep: dict) -> str:
         reach = "OK" if pr.get("reachable") else f"UNREACHABLE ({pr.get('error','?')})"
         lines.append(f"  {pr.get('url')}  [{reach}]")
 
+    sx = rep.get("searxng", {})
+    lines.append("")
+    lines.append("SearXNG (preferred search backend):")
+    if not sx.get("configured"):
+        lines.append(f"  not configured — {sx.get('note','')}")
+    elif not sx.get("reachable"):
+        lines.append(f"  {sx.get('url')}  [UNREACHABLE ({sx.get('error','?')})]")
+        if sx.get("autostart"):
+            lines.append(f"  autostart: {sx['autostart']}")
+    elif sx.get("json_format") is False:
+        lines.append(f"  {sx.get('url')}  [JSON FORMAT DISABLED — {sx.get('error','?')}]")
+    else:
+        rc = sx.get("result_count", 0)
+        lines.append(f"  {sx.get('url')}  [OK, smoke probe returned {rc} results]")
+        if sx.get("autostart"):
+            lines.append(f"  autostart: {sx['autostart']}")
+        unresp = sx.get("unresponsive_engines") or []
+        if unresp:
+            lines.append(f"  unresponsive: {', '.join(unresp)}")
+
     tools = []
     for k in ("pdftotext", "yt_dlp"):
         info = rep.get(k, {})
         mark = "ok" if info.get("available") else "missing"
         tools.append(f"  {k:10s} : {mark}  ({info.get('path') or '-'})")
+    yt_api = rep.get("youtube_transcript_api", {})
+    yt_api_mark = "ok" if yt_api.get("available") else "missing (pipx inject websearch youtube-transcript-api)"
+    tools.append(f"  yt_api     : {yt_api_mark}")
+    yt_cookies = rep.get("yt_cookies_from") or ""
+    if yt_cookies:
+        tools.append(f"  yt_cookies : $WEBSEARCH_YT_COOKIES_FROM={yt_cookies}")
     lines.append("")
     lines.append("External tools:")
     lines.extend(tools)

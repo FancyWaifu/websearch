@@ -110,6 +110,34 @@ def filter_required(results: list[dict], required: Iterable[str]) -> list[dict]:
     return kept
 
 
+_MISSING_RE = re.compile(r"\bMissing:\s*\S", re.IGNORECASE)
+
+
+def demote_missing_terms(results: list[dict]) -> list[dict]:
+    """Push results whose snippet contains a `Missing: ...` annotation to the
+    bottom of the list.
+
+    Google (and SearXNG when it proxies Google) appends `Missing: <terms>`
+    to a snippet when the page didn't actually contain some of the queried
+    terms — these are the engine *admitting* the match is partial. Without
+    this demotion, a hyper-specific query like
+    "Mizzou INFOTC 4910 digital forensics syllabus 2026" can return an NIH
+    spreadsheet as #1 just because it happened to contain "2026". Original
+    order is preserved within each bucket so we don't fight the engine's
+    relevance ordering on real matches.
+    """
+    if not results:
+        return results
+    kept, demoted = [], []
+    for r in results:
+        snippet = r.get("snippet", "") or ""
+        (demoted if _MISSING_RE.search(snippet) else kept).append(r)
+    out = kept + demoted
+    for i, r in enumerate(out, start=1):
+        r["rank"] = i
+    return out
+
+
 def boost_by_query_count(per_query: dict, merged: list[dict]) -> list[dict]:
     """Re-sort `merged` so URLs that appeared in multiple sub-queries float up.
 

@@ -173,6 +173,42 @@ def _add_rerank_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _warn_if_empty(report: dict, args: argparse.Namespace, queries: list[str]) -> None:
+    """Emit a stderr WARNING when search returned zero usable results.
+
+    Distinguishes the three common causes so the user knows where to look:
+    a filter dropped everything, all engines were unresponsive, or the
+    query genuinely matched nothing. Without this, `Search: N queries -> 0
+    unique results` is the only signal — easy to misread as a real
+    no-match when it's actually a filter or rate-limit issue.
+    """
+    if report.get("unique"):
+        return
+    per_query = report.get("queries") or {}
+    n_raw = sum(len(v.get("results") or []) for v in per_query.values())
+    engine_errors = [
+        f"{q!r}: {v['error']}"
+        for q, v in per_query.items()
+        if v.get("error")
+    ]
+    msg = [f"WARNING: research returned 0 sources for {queries[0]!r}."]
+    if getattr(args, "trust", "any") == "high":
+        msg.append("  - --trust high accepts only .gov/.edu/journals/major "
+                   "news; try --trust medium for a wider pool.")
+    if engine_errors:
+        msg.append("  - engine errors: " + "; ".join(engine_errors))
+    if n_raw == 0:
+        sx = getattr(args, "searxng", None) or os.environ.get("WEBSEARCH_SEARXNG")
+        if not sx:
+            msg.append("  - SearXNG not configured ($WEBSEARCH_SEARXNG); "
+                       "DDG/Bing scraping is rate-limited and often empties.")
+        msg.append("  - run `websearch doctor` to check engine reachability.")
+    else:
+        msg.append(f"  - {n_raw} raw result(s) were dropped by filters "
+                   "(--trust / --exclude / --require / reputation block).")
+    print("\n".join(msg), file=sys.stderr)
+
+
 def _enforce_since(fetched: list, since: str) -> list:
     """Drop fetched results whose extracted published date is before `since`.
 
@@ -578,6 +614,9 @@ def _apply_rerank_pipeline(
     merged = report.get("unique", [])
     if not merged:
         return report
+    # Demote first: SERP-admitted partial matches (`Missing: <terms>`) shouldn't
+    # outrank real matches no matter what else the pipeline does.
+    merged = _rerank.demote_missing_terms(merged)
     if len(report.get("queries", {})) > 1:
         merged = _rerank.boost_by_query_count(report["queries"], merged)
     if require_terms:
@@ -596,10 +635,13 @@ def _research_frontmatter(args: argparse.Namespace, queries: list[str], report: 
     proxy_used = proxy_conf and reach is True
     unique = report.get("unique", []) or []
     fetched = report.get("fetched", []) or []
+    # ISO 8601 with the local UTC offset — bare `2026-05-27T13:04:14` was
+    # ambiguous when the report was read days later in another timezone.
+    ts = _dt.datetime.now().astimezone().isoformat(timespec="seconds")
     fm = [
         "---",
         f"title: {json.dumps(queries[0])}",
-        f"timestamp: {_dt.datetime.now().isoformat(timespec='seconds')}",
+        f"timestamp: {ts}",
         f"trust: {args.trust}",
         f"depth: {args.depth}",
         f"proxy_used: {str(proxy_used).lower()}",
@@ -675,6 +717,7 @@ def cmd_research(args: argparse.Namespace) -> int:
         )
     report["_proxy_reachable"] = reach
     report["_backfilled"] = 0
+    _warn_if_empty(report, args, queries)
 
     if report.get("unique"):
         # #4: fetch the top `depth`, backfilling failed fetches from the

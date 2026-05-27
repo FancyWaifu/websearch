@@ -13,6 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 mcp = ["mcp>=1.2"]
+youtube = ["youtube-transcript-api>=0.6"]
 
 [project.scripts]
 websearch = "websearch.cli:main"

@@ -218,6 +218,10 @@ class FetchResult:
     # extractable from the body. Declared here so asdict() preserves it; the
     # render path also re-extracts when this is unset.
     published_date: Optional[str] = None
+    # True when a 200 response body matched a soft-404 pattern. `error` is
+    # also set in that case so the rest of the pipeline (research backfill,
+    # MCP error path) treats it as a failure.
+    soft_404: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -351,6 +355,35 @@ def _looks_empty(html: str) -> Optional[str]:
     return None
 
 
+# Pages that respond 200 but whose body is a "page not found" UI. Caught
+# observed on linkedin.com, github.com (some 404s), medium.com, etc. — the
+# server prefers a soft-404 over a real 404 to keep ad/analytics flowing.
+# Without this, research silently inlines the 404 page as if it were
+# successful content.
+_SOFT_404_PATTERNS = (
+    re.compile(r"\bpage (?:you|we)(?:'re| are| were)? looking for (?:may have been |was )?(?:can(?:'|no)t be found|moved|removed|no longer exists?)", re.IGNORECASE),
+    re.compile(r"\b(?:we|sorry,? we) can(?:'|no)?t find (?:the |that )?page", re.IGNORECASE),
+    re.compile(r"\b(?:404|page) not found\b", re.IGNORECASE),
+    re.compile(r"\bthis page (?:does|doesn'?t|cannot)\s*(?:not\s+)?exists?\b", re.IGNORECASE),
+    re.compile(r"\boops!?\s+(?:looks like|the page)", re.IGNORECASE),
+)
+# Soft-404 detection runs only on small page bodies — long pages are
+# almost never error pages, so the regex sweep is wasted work. 8 KB is
+# enough room for a typical error template + a noisy footer.
+_SOFT_404_MAX_BODY_BYTES = 8192
+
+
+def _looks_soft_404(html: str) -> Optional[str]:
+    """Return the matched pattern if `html` looks like a 200-OK error page."""
+    if not html or len(html) > _SOFT_404_MAX_BODY_BYTES:
+        return None
+    for pat in _SOFT_404_PATTERNS:
+        m = pat.search(html)
+        if m:
+            return m.group(0)
+    return None
+
+
 def fetch_direct(
     url: str,
     timeout: int = 20,
@@ -441,6 +474,14 @@ def fetch_direct(
         err = f"transcript unavailable: {_yt_error}"
     else:
         err = None
+    # Soft-404 detection: a 200 with a "page not found" UI is no more useful
+    # than a real 404 — surface it as an error so research backfill can drop
+    # it and pick the next-ranked source instead of inlining a 404 page.
+    soft_404_match: Optional[str] = None
+    if err is None and not is_pdf and r.status_code == 200 and text:
+        soft_404_match = _looks_soft_404(text)
+        if soft_404_match:
+            err = f"soft_404: matched {soft_404_match!r}"
     result = FetchResult(
         url=url,
         final_url=r.url,
@@ -450,9 +491,13 @@ def fetch_direct(
         via="direct",
         error=err,
         is_pdf=is_pdf,
+        soft_404=bool(soft_404_match),
     )
-    # Only cache successful responses (text-only, including extracted PDF text)
-    if cache and result.status and result.status < 400 and result.text:
+    # Only cache successful responses (text-only, including extracted PDF
+    # text). Skip soft-404 bodies — caching them would make the soft-404
+    # detection a one-shot, and stale 404 pages aren't worth disk space.
+    if (cache and result.status and result.status < 400
+            and result.text and not result.soft_404):
         cache.put(
             "GET",
             url,
@@ -640,6 +685,38 @@ def _extract_raw(html: str) -> str:
     return (soup.body or soup).get_text("\n", strip=True)
 
 
+_NOPROSE_FENCE_LANGS = ("mermaid", "graphviz", "dot", "plantuml", "ascii",
+                        "asciiart", "svg")
+_NOPROSE_FENCE_RE = re.compile(
+    r"```(" + "|".join(_NOPROSE_FENCE_LANGS) + r")\b.*?```",
+    re.IGNORECASE | re.DOTALL,
+)
+# Some sites strip the fences but leave the diagram source as plain text.
+# Mermaid in particular leaks `flowchart LR / subgraph X / A --> B` blocks
+# that aren't useful as prose. Detect runs of `-->` or `subgraph` near a
+# `flowchart` keyword and drop them.
+_MERMAID_BARE_RE = re.compile(
+    r"(?:^|\n)(?:flowchart|graph|sequenceDiagram|gantt|stateDiagram|"
+    r"classDiagram|erDiagram|journey|gitGraph)\b[\s\S]{0,2000}?"
+    r"(?=\n\n|\n[A-Z][a-z]|\Z)",
+    re.IGNORECASE,
+)
+
+
+def _strip_noprose_fences(text: str) -> str:
+    """Replace mermaid/graphviz/dot/etc. blocks with a marker.
+
+    These render as pictures, not prose; passing them through as plain
+    text just fills the truncation budget with `A --> B; subgraph X` noise
+    that a reader can't parse. Marker preserves the *fact* something was
+    there without bleeding the source into the report body."""
+    if not text:
+        return text
+    text = _NOPROSE_FENCE_RE.sub("\n[diagram omitted]\n", text)
+    text = _MERMAID_BARE_RE.sub("\n[diagram omitted]\n", text)
+    return text
+
+
 def html_to_text(
     html: str,
     max_chars: Optional[int] = None,
@@ -684,6 +761,7 @@ def html_to_text(
             main = soup.find("main") or soup.find("article") or soup.body or soup
             text = main.get_text("\n", strip=True)
 
+    text = _strip_noprose_fences(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     if skip_chars and skip_chars < len(text):
         text = text[skip_chars:]
@@ -804,6 +882,17 @@ def _filter_excluded(
 
 
 _BING_CKA_VERSION_RE = re.compile(r"^a\d+")
+# Engine ad-redirect URLs. Both engines serve sponsored placements through
+# these — they're not organic results and unwrapping just exposes affiliate
+# URLs with utm_/msclkid/etc. tracking. Drop them entirely at parse time.
+_AD_REDIRECT_PATTERNS = (
+    re.compile(r"^(?:https?:)?//(?:[\w.-]+\.)?duckduckgo\.com/y\.js\b", re.IGNORECASE),
+    re.compile(r"^(?:https?:)?//(?:[\w.-]+\.)?bing\.com/aclick\b", re.IGNORECASE),
+)
+
+
+def _is_ad_redirect(href: str) -> bool:
+    return any(p.match(href) for p in _AD_REDIRECT_PATTERNS)
 
 
 def _unwrap_bing(href: str) -> str:
@@ -850,7 +939,7 @@ def _parse_results(html: str, selectors_list: list[dict], unwrap_ddg: bool = Fal
             # Cheap no-op on non-Bing hrefs; Bing serves most result links
             # through bing.com/ck/a? wrappers that hide the real target.
             href = _unwrap_bing(href)
-            if not href or href.startswith("#"):
+            if not href or href.startswith("#") or _is_ad_redirect(href):
                 continue
             results.append(
                 SearchResult(
@@ -1128,10 +1217,20 @@ def search_searxng(
     except Exception as e:
         raise RuntimeError(f"SearXNG JSON parse failed: {e}") from e
 
+    # SearXNG reports per-engine failures in `unresponsive_engines` as a
+    # list of [name, reason] pairs. Surface them — when half the engines
+    # are captcha'd or timing out, the user needs to know the result pool
+    # is degraded, not just trust the count.
+    unresp = data.get("unresponsive_engines") or []
+    if unresp:
+        names = ", ".join(f"{name} ({reason})" for name, reason in unresp)
+        print(f"websearch: SearXNG engines unresponsive: {names}",
+              file=sys.stderr)
+
     results: list[SearchResult] = []
     for i, item in enumerate(data.get("results", []) or [], start=1):
         u = item.get("url", "")
-        if not u:
+        if not u or _is_ad_redirect(u):
             continue
         results.append(
             SearchResult(

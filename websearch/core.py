@@ -614,12 +614,19 @@ def fetch_many(
     refresh: bool = False,
     verify: bool = True,
     use_whisper: bool = False,
+    progress: Optional[Callable[[int, int, "FetchResult"], None]] = None,
 ) -> list[FetchResult]:
-    """Fetch many URLs concurrently. Preserves input order in the result."""
+    """Fetch many URLs concurrently. Preserves input order in the result.
+
+    `progress` is an optional callback invoked once per completed fetch
+    with `(idx, total, result)` where idx is the input position. Fires
+    in completion order (not input order) so callers can stream UI
+    updates as fetches finish."""
     fns = {"smart": fetch_smart, "direct": fetch_direct, "wayback": fetch_wayback}
     fn = fns.get(via, fetch_smart)
     urls = list(urls)
-    results: list[Optional[FetchResult]] = [None] * len(urls)
+    total = len(urls)
+    results: list[Optional[FetchResult]] = [None] * total
     # Wayback doesn't take use_whisper, so only forward it to the YouTube-
     # capable callers. Direct/smart paths fall through to fetch_transcript.
     extra: dict = {"use_whisper": use_whisper} if fn is not fetch_wayback else {}
@@ -641,9 +648,17 @@ def fetch_many(
         for fut in as_completed(futures):
             i = futures[fut]
             try:
-                results[i] = fut.result()
+                fr = fut.result()
             except Exception as e:
-                results[i] = FetchResult(urls[i], urls[i], 0, "", "", via, str(e))
+                fr = FetchResult(urls[i], urls[i], 0, "", "", via, str(e))
+            results[i] = fr
+            if progress is not None:
+                try:
+                    progress(i, total, fr)
+                except Exception:
+                    # Progress callbacks shouldn't be able to kill the
+                    # batch fetch — swallow and move on.
+                    pass
     return [r for r in results if r is not None]  # type: ignore[return-value]
 
 

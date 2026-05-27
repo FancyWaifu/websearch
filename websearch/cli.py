@@ -226,6 +226,26 @@ def _warn_if_empty(report: dict, args: argparse.Namespace, queries: list[str]) -
     print("\n".join(msg), file=sys.stderr)
 
 
+def _make_stream_progress(args: argparse.Namespace):
+    """Build a progress callback that prints one stderr line per completed
+    fetch, so `research` feels interactive instead of going dark for 10s.
+    Suppressed when --format json (callers want a single structured
+    output) or --no-stream is set."""
+    if getattr(args, "format", None) == "json":
+        return None
+    start = time.time()
+
+    def progress(idx: int, total: int, fr) -> None:
+        elapsed = int((time.time() - start) * 1000)
+        status = "ok" if (fr.error is None and (fr.text or "").strip()) else f"FAIL: {fr.error or 'empty'}"
+        # Title is unknown at fetch time (it comes from the search snippet,
+        # not the body), so just show URL + status.
+        print(f"  [{idx + 1}/{total}] {fr.url}  [{status}, {elapsed}ms]",
+              file=sys.stderr, flush=True)
+
+    return progress
+
+
 def _resolve_backend(args: argparse.Namespace) -> Optional[str]:
     """Translate the --backend argparse value into what search_smart wants.
     'auto' means 'use the fallback chain' which is the function's default
@@ -753,6 +773,7 @@ def cmd_research(args: argparse.Namespace) -> int:
     if report.get("unique"):
         # #4: fetch the top `depth`, backfilling failed fetches from the
         # rest of the ranked pool so dead links don't waste a source slot.
+        progress_cb = _make_stream_progress(args) if getattr(args, "stream", True) else None
         fetched, n_backfilled = _fetch_top_with_backfill(
             report["unique"],
             args.depth,
@@ -764,6 +785,7 @@ def cmd_research(args: argparse.Namespace) -> int:
                 max_age=args.max_age,
                 refresh=args.refresh,
                 use_whisper=getattr(args, "whisper", False),
+                progress=progress_cb,
             ),
         )
         report["_backfilled"] = n_backfilled
@@ -1506,6 +1528,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="for any YouTube source with no captions, transcribe audio "
         "locally via faster-whisper (opt-in, slow). See `fetch --whisper`.",
+    )
+    rs.add_argument(
+        "--no-stream",
+        dest="stream",
+        action="store_false",
+        default=True,
+        help="suppress the per-source stderr progress lines that print as "
+        "each fetch completes. On by default; auto-suppressed for "
+        "--format json. Use when piping stderr matters.",
     )
     # Research defaults: favor clean sources out of the box
     rs.set_defaults(func=cmd_research, trust="medium")

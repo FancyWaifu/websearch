@@ -774,7 +774,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
         # When --jq is set, treat the body as JSON and emit the filter output directly
         if getattr(args, "jq", None) and result.text:
-            print(_apply_jq(result.text, args.jq), end="" if "\n" in _apply_jq(result.text, args.jq) else "\n")
+            filtered = _apply_jq(result.text, args.jq)
+            print(filtered, end="" if "\n" in filtered else "\n")
             return 0 if result.error is None else 1
 
         return _print_fetch_text(

@@ -12,7 +12,10 @@ environment with:  pipx inject websearch mcp
 """
 from __future__ import annotations
 
+import ipaddress
+import socket
 from typing import Optional
+from urllib.parse import urlparse
 
 from .cache import default as default_cache
 from .core import (
@@ -30,6 +33,56 @@ _MISSING_MCP_HINT = (
     "Install it into the websearch environment with:\n"
     "    pipx inject websearch mcp\n"
 )
+
+_BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
+
+
+def _ip_is_public(addr: str) -> bool:
+    """True iff `addr` parses to an IP outside the private/loopback/link-local/
+    multicast/reserved/unspecified ranges. Catches IPv4 and IPv6 alike."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    )
+
+
+def _url_safety_error(url: str) -> Optional[str]:
+    """Return a human-readable reason the URL is unsafe to fetch from the MCP
+    server, or None if it's a public http(s) URL.
+
+    Blocks: non-http(s) schemes (file://, gopher://, ...), bare or
+    DNS-resolved private/loopback/link-local/multicast IPs (cloud metadata
+    169.254.169.254, LAN hosts 192.168.x.x, localhost, ...), and explicit
+    localhost-style hostnames. This is the SSRF gate for an MCP-exposed
+    fetch — an MCP client (or prompt injection through search results) must
+    not be able to reach internal services through this process."""
+    try:
+        p = urlparse(url)
+    except Exception as e:  # noqa: BLE001
+        return f"unparseable URL: {e}"
+    if p.scheme not in ("http", "https"):
+        return f"only http(s) URLs are allowed (got scheme: {p.scheme or 'none'})"
+    host = (p.hostname or "").lower()
+    if not host:
+        return "URL has no host"
+    if host in _BLOCKED_HOSTS:
+        return f"host {host!r} is blocked"
+    # Resolve to all addresses (handles IPv6 + multi-A records). Any
+    # non-public answer fails the check — DNS rebinding is out of scope
+    # for a single-shot validate-then-fetch, but a single private address
+    # is enough to refuse.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        return f"DNS resolution failed for {host!r}: {e}"
+    for info in infos:
+        if not _ip_is_public(info[4][0]):
+            return f"host {host!r} resolves to a non-public address ({info[4][0]})"
+    return None
 
 
 def build_server():
@@ -69,6 +122,9 @@ def build_server():
         """Fetch a URL and return its readable text (Wayback fallback on
         failure, transcript extraction for YouTube). Truncated to max_chars
         at a clean boundary."""
+        unsafe = _url_safety_error(url)
+        if unsafe:
+            return f"refused to fetch {url}: {unsafe}"
         try:
             res = fetch_smart(url, cache=default_cache())
         except Exception as e:  # noqa: BLE001
@@ -103,6 +159,10 @@ def build_server():
         if not merged:
             return f"No results for: {question}"
 
+        # Defense-in-depth: drop poisoned/internal URLs before fetching, so a
+        # search result pointing at e.g. 169.254.169.254 can't reach internal
+        # services through this process.
+        merged = [r for r in merged if _url_safety_error(r.get("url", "")) is None]
         top = merged[: max(1, depth)]
         out = [
             f"# Research: {question}",

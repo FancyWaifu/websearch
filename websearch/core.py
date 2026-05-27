@@ -1,6 +1,7 @@
 """Core fetch and search logic."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import random
@@ -14,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
 from typing import Callable, Iterable, Optional
-from urllib.parse import quote_plus, unquote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -802,6 +803,36 @@ def _filter_excluded(
     return out
 
 
+_BING_CKA_VERSION_RE = re.compile(r"^a\d+")
+
+
+def _unwrap_bing(href: str) -> str:
+    """Decode a Bing `bing.com/ck/a?...&u=a1<urlsafe-b64-url>` wrapper.
+
+    Bing routes most result links through this redirector; without unwrapping,
+    every search result URL is a useless click-tracking link. The `u=` param
+    holds urlsafe-base64 of the target URL prefixed with a version marker
+    (`a1`/`a2`/...) and is often unpadded. Returns `href` unchanged if it
+    isn't a recognized wrapper, so the call is safe on any href.
+    """
+    try:
+        p = urlparse(href)
+    except Exception:
+        return href
+    if "bing.com" not in (p.netloc or "").lower() or not p.path.startswith("/ck/a"):
+        return href
+    u = (parse_qs(p.query).get("u") or [""])[0]
+    if not u:
+        return href
+    enc = _BING_CKA_VERSION_RE.sub("", u)
+    pad = "=" * (-len(enc) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(enc + pad).decode("utf-8", errors="replace")
+    except Exception:
+        return href
+    return decoded if decoded.startswith(("http://", "https://")) else href
+
+
 def _parse_results(html: str, selectors_list: list[dict], unwrap_ddg: bool = False) -> list[SearchResult]:
     soup = BeautifulSoup(html, "lxml")
     for sels in selectors_list:
@@ -816,6 +847,9 @@ def _parse_results(html: str, selectors_list: list[dict], unwrap_ddg: bool = Fal
                 m = re.search(r"uddg=([^&]+)", href)
                 if m:
                     href = unquote(m.group(1))
+            # Cheap no-op on non-Bing hrefs; Bing serves most result links
+            # through bing.com/ck/a? wrappers that hide the real target.
+            href = _unwrap_bing(href)
             if not href or href.startswith("#"):
                 continue
             results.append(

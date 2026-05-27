@@ -26,6 +26,7 @@ from .core import (
     search_smart,
 )
 from . import rerank as _rerank
+from . import openalex as _openalex
 
 
 _MISSING_MCP_HINT = (
@@ -96,11 +97,27 @@ def build_server():
 
     @mcp.tool()
     def search(query: str, max_results: int = 10, trust: str = "medium") -> str:
-        """Search the web and return ranked results (title, URL, snippet).
+        """Search the web and return a ranked list of (title, URL, snippet).
 
-        trust: 'any' (no filter), 'medium' (drop SEO/affiliate spam),
-        'high' (trusted sources only). Tries SearXNG (if $WEBSEARCH_SEARXNG
-        is set), then DuckDuckGo, then Bing.
+        Use this for: discovering URLs to read next, finding multiple
+        perspectives on a question, or surveying what's been written on a
+        topic. Returns the engine name used + up to `max_results` results.
+        Does NOT fetch page content — pair with `fetch` when you need the
+        actual body.
+
+        Args:
+            query: the search query string. Phrases in double quotes are
+                exact-match.
+            max_results: cap on results returned (default 10, max ~20 in
+                practice based on engine behavior).
+            trust: filter strictness. 'any' = no filter, 'medium' (default)
+                drops SEO/affiliate spam via the reputation blocklist,
+                'high' restricts to .gov/.edu/journals/major news.
+
+        Returns:
+            Markdown text. Header line names the engine ("engine: searxng"
+            or "engine: duckduckgo" etc.) so the caller can see which
+            backend served the results.
         """
         try:
             engine, results = search_smart(
@@ -119,9 +136,28 @@ def build_server():
 
     @mcp.tool()
     def fetch(url: str, max_chars: int = 4000) -> str:
-        """Fetch a URL and return its readable text (Wayback fallback on
-        failure, transcript extraction for YouTube). Truncated to max_chars
-        at a clean boundary."""
+        """Fetch one URL and return its readable text content.
+
+        Use this when you have a URL (from `search`, the user, or your
+        own reasoning) and need the actual page content. Handles three
+        special cases automatically:
+            - PDF URLs -> extracts text via pdftotext (no manual flag)
+            - YouTube URLs -> fetches the captions/transcript via the
+              youtube-transcript-api (no video download)
+            - Failed direct fetch -> falls back to the Wayback Machine
+
+        Args:
+            url: an http(s) URL. Internal/private addresses (169.254/16,
+                10/8, 192.168/16, localhost, file://, etc.) are refused
+                for SSRF safety.
+            max_chars: truncate the body at this many chars. Truncation
+                is at a paragraph/sentence boundary, never mid-word.
+
+        Returns:
+            Markdown with a header line ("status N, via direct|wayback|
+            cache") followed by the cleaned text. On failure returns
+            "ERROR fetching <url>: <reason>" — check for that prefix.
+        """
         unsafe = _url_safety_error(url)
         if unsafe:
             return f"refused to fetch {url}: {unsafe}"
@@ -143,9 +179,31 @@ def build_server():
         trust: str = "medium",
         max_chars_per_source: int = 2500,
     ) -> str:
-        """Multi-query research: search several angles of a question, dedupe
-        and rerank the pool, fetch the top `depth` sources, and return one
-        consolidated markdown document with the source content inline."""
+        """Multi-query web research: search → dedupe → rerank → fetch → bundle.
+
+        Use this when you'd otherwise call `search` + several `fetch`es
+        for the same question. Saves round-trips and produces one
+        consolidated markdown document with the source bodies inlined,
+        ready to cite or summarize.
+
+        Args:
+            question: the primary research question (drives ranking).
+            related_queries: extra angles to search in parallel; results
+                are deduped against the primary query's pool. Pass 1-3
+                related framings for best coverage.
+            depth: how many top sources to actually fetch (default 5).
+                More = better recall, slower, more tokens in output.
+            trust: same as `search` — 'any' / 'medium' / 'high'.
+            max_chars_per_source: per-fetched-source truncation (default
+                2500). Reduce when you'll combine with several other tool
+                calls in the same context window.
+
+        Returns:
+            Markdown document with a results list, then `## <title>` +
+            URL + extracted body for each fetched source. Failed fetches
+            appear as `_(could not fetch: <reason>)_` so the caller can
+            see what was attempted.
+        """
         queries = [question] + [q for q in (related_queries or []) if q.strip()]
         try:
             report = search_many(queries, dedupe=True, trust=trust)
@@ -180,6 +238,98 @@ def build_server():
                 continue
             out.append("\n" + html_to_text(fr.text, max_chars=max_chars_per_source) + "\n")
         return "\n".join(out)
+
+    @mcp.tool()
+    def cite(urls: list[str]) -> str:
+        """Generate a markdown citation block for one or more URLs.
+
+        Use this when you've referenced URLs in a response and want a
+        clean `## Sources` block at the bottom. Fetches each URL just
+        enough to extract its `<title>`; falls through to the URL itself
+        if the title can't be read.
+
+        Args:
+            urls: list of http(s) URLs to cite. Order is preserved.
+
+        Returns:
+            Markdown:
+                Sources:
+                - [Page Title](https://...)
+                - [Other Page](https://...)
+            One entry per input URL, even if the fetch failed.
+        """
+        if not urls:
+            return "Sources:\n(none)"
+        clean: list[str] = []
+        for u in urls:
+            if _url_safety_error(u):
+                clean.append(f"- {u}  _(refused: internal URL)_")
+                continue
+            try:
+                r = fetch_smart(u, cache=default_cache())
+            except Exception as e:  # noqa: BLE001
+                clean.append(f"- [{u}]({u})  _(fetch failed: {e})_")
+                continue
+            title = ""
+            if r.text:
+                try:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(r.text, "lxml")
+                    if soup.title and soup.title.string:
+                        title = soup.title.string.strip()
+                except Exception:
+                    pass
+            clean.append(f"- [{title or u}]({u})")
+        return "Sources:\n" + "\n".join(clean)
+
+    @mcp.tool()
+    def papers(
+        query: str,
+        max_results: int = 5,
+        year_min: Optional[int] = None,
+        year_max: Optional[int] = None,
+        min_citations: Optional[int] = None,
+        oa_only: bool = False,
+    ) -> str:
+        """Search OpenAlex (250M+ academic works) for scholarly papers.
+
+        Use this INSTEAD of `search` when you specifically want
+        peer-reviewed work: title, authors, year, journal, citation count,
+        DOI, OA URL, and abstract. Far higher signal than scraping Google
+        Scholar — OpenAlex has structured metadata you'd otherwise have to
+        regex out of HTML.
+
+        Args:
+            query: the research topic (free text, not boolean).
+            max_results: 5-25 typical; OpenAlex returns ranked by
+                relevance.
+            year_min, year_max: bound the publication year window.
+            min_citations: drop papers with fewer than N citations
+                (good for filtering to established work).
+            oa_only: when True, restrict to open-access papers that have
+                a downloadable PDF.
+
+        Returns:
+            Markdown listing per paper: title, authors, year, journal,
+            citation count, DOI link, OA PDF link if available, and the
+            abstract. Header reports the total match count so you know
+            the search wasn't suspiciously narrow.
+        """
+        try:
+            articles, _total = _openalex.fetch_articles(
+                query,
+                max_results=max_results,
+                year_min=year_min,
+                year_max=year_max,
+                min_citations=min_citations,
+                oa_only=oa_only,
+                cache=default_cache(),
+            )
+        except Exception as e:  # noqa: BLE001
+            return f"papers search failed: {e}"
+        if not articles:
+            return f"No papers found for: {query}"
+        return _openalex.to_markdown(query, articles)
 
     return mcp
 

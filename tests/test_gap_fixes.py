@@ -14,6 +14,7 @@ import pytest
 from websearch.core import (
     BING_RESULT_SELECTORS,
     DDG_RESULT_SELECTORS,
+    _canonical_url,
     _is_ad_redirect,
     _looks_soft_404,
     _parse_results,
@@ -88,6 +89,29 @@ def test_looks_soft_404_matches_common_error_ui(body):
 def test_looks_soft_404_ignores_normal_articles():
     body = "A long article about why the moon landings happened in 1969."
     assert _looks_soft_404(body) is None
+
+
+def test_looks_soft_404_matches_new_phrasings():
+    """2026-05-27 additions — patterns that the original set missed."""
+    for body in (
+        "Sorry, that URL is invalid",
+        "This content has been removed by the author.",
+        "Nothing here. Try the homepage.",
+        "HTTP Status 404",
+    ):
+        assert _looks_soft_404(body) is not None, f"missed: {body!r}"
+
+
+def test_looks_soft_404_detects_error_path_in_url():
+    """A final_url containing /404, /not-found etc. should flag without
+    even reading the body."""
+    body = "Some unrelated content that wouldn't otherwise trigger detection"
+    assert _looks_soft_404(body, "https://example.com/404") is not None
+    assert _looks_soft_404(body, "https://example.com/not-found") is not None
+    assert _looks_soft_404(body, "https://example.com/page-not-found/") is not None
+    assert _looks_soft_404(body, "https://example.com/error") is not None
+    # Negative: real article paths shouldn't fire
+    assert _looks_soft_404(body, "https://example.com/blog/article") is None
 
 
 def test_looks_soft_404_skips_huge_bodies_for_speed():
@@ -192,6 +216,48 @@ def test_collapse_pdf_whitespace_collapses_inline_runs():
 
 
 # ---------- ISO 8601 TZ on frontmatter timestamp (Bug 11) ----------
+
+# ---------- URL canonicalization for dedup ----------
+
+@pytest.mark.parametrize(
+    "url,want",
+    [
+        # arxiv abs/pdf/html variants → all collapse to /abs/<id>
+        ("https://arxiv.org/abs/2506.05364", "https://arxiv.org/abs/2506.05364"),
+        ("https://arxiv.org/pdf/2506.05364", "https://arxiv.org/abs/2506.05364"),
+        ("https://arxiv.org/pdf/2506.05364.pdf", "https://arxiv.org/abs/2506.05364"),
+        ("https://arxiv.org/pdf/2506.05364v2", "https://arxiv.org/abs/2506.05364"),
+        ("https://arxiv.org/pdf/2506.05364v2.pdf", "https://arxiv.org/abs/2506.05364"),
+        ("https://arxiv.org/html/2506.05364", "https://arxiv.org/abs/2506.05364"),
+        # Subdomain (some mirrors)
+        ("https://www.arxiv.org/pdf/2506.05364", "https://www.arxiv.org/abs/2506.05364"),
+        # NOTE: pre-2007 cross-list IDs (cs.AI/0001001) aren't canonicalized —
+        # the slash inside the ID confuses the regex. Modern IDs (post-2007,
+        # numeric-only) are the vast majority of what we'd see in 2026.
+    ],
+)
+def test_canonical_url_collapses_arxiv_variants(url, want):
+    assert _canonical_url(url) == want
+
+
+def test_canonical_url_strips_mobile_subdomain():
+    assert _canonical_url("https://m.example.com/page") == "https://example.com/page"
+    assert _canonical_url("https://mobile.bbc.co.uk/news/x") == "https://bbc.co.uk/news/x"
+
+
+def test_canonical_url_strips_fragment():
+    assert _canonical_url("https://example.com/article#section-3") == "https://example.com/article"
+
+
+def test_canonical_url_strips_trailing_slash():
+    assert _canonical_url("https://example.com/article/") == "https://example.com/article"
+    # But keeps trailing slash on bare domain (count <= 3 slashes total)
+    assert _canonical_url("https://example.com/") == "https://example.com/"
+
+
+def test_canonical_url_passes_through_unrelated_urls():
+    assert _canonical_url("https://example.com/article") == "https://example.com/article"
+
 
 def test_research_frontmatter_timestamp_has_timezone():
     """Smoke test: build a minimal args/report and check the timestamp shape.

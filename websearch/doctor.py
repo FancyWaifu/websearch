@@ -96,6 +96,55 @@ def _yt_dlp_probe(path: Optional[str], runtime: Optional[str] = None) -> dict:
     return out
 
 
+# Known-stable YouTube video used for the n-challenge end-to-end probe.
+# A short, public, captioned video that's been live for years — if
+# yt-dlp can extract real audio formats for this one, the EJS toolchain
+# is actually working, not just superficially installed.
+_PROBE_VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # "Me at the zoo", 19s
+_PROBE_FORMAT_RE = re.compile(r"^\d+\s+\w+\s+\d+x\d+", re.MULTILINE)
+
+
+def n_challenge_probe(yt_dlp_path: Optional[str], runtime: Optional[str] = None,
+                      timeout: float = 15.0) -> dict:
+    """Actually solve YouTube's n-challenge end-to-end. The libs-installed
+    checks (yt_dlp_ejs + JS runtime) can both be 'ok' while extraction
+    still fails because YouTube changed something this week. This probe
+    runs `yt-dlp --list-formats` on a known-stable test video and counts
+    the non-storyboard formats returned. >5 = working; 0 (only `sb` storyboard
+    formats) = broken; failed run = broken.
+
+    Returns dict with keys:
+        - status: 'ok' | 'broken' | 'unknown'
+        - format_count: int (non-storyboard formats; storyboard-only = broken)
+        - error: optional str when the run failed outright
+    """
+    if not yt_dlp_path:
+        return {"status": "unknown", "format_count": 0,
+                "error": "yt-dlp not installed"}
+    runtime = runtime if runtime is not None else os.environ.get(
+        "WEBSEARCH_YT_JS_RUNTIME", "node")
+    cmd = [yt_dlp_path, "--quiet", "--no-warnings", "--list-formats", "--skip-download"]
+    if runtime:
+        cmd[1:1] = ["--js-runtimes", runtime]
+    cookies = os.environ.get("WEBSEARCH_YT_COOKIES_FROM")
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    cmd += ["--", _PROBE_VIDEO]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "broken", "format_count": 0, "error": str(e)}
+    text = r.stdout.decode("utf-8", errors="replace")
+    # Format-line pattern: ID EXT RESOLUTION ... — storyboard rows are
+    # "sb0 mhtml 48x27" which doesn't match the `\d+ \w+ \d+x\d+` shape.
+    formats = _PROBE_FORMAT_RE.findall(text)
+    return {
+        "status": "ok" if formats else "broken",
+        "format_count": len(formats),
+        "error": None if formats else "no playable formats returned (n-challenge or PO Token)",
+    }
+
+
 _YT_DLP_VERSION_RE = re.compile(r"(\d{4})\.(\d{1,2})\.(\d{1,2})")
 
 
@@ -278,6 +327,11 @@ def report(proxy: Optional[str] = None) -> dict:
         # a separate venv, so a Python-side import check would give the wrong
         # answer. See _yt_dlp_probe docstring.
         "yt_dlp_probe": _yt_dlp_probe(shutil.which("yt-dlp")),
+        # End-to-end probe: ask yt-dlp to list formats for a known-stable
+        # test video. Costs ~2-5s of network, but it's the only way to tell
+        # "libs installed" from "actually working today" given YouTube's
+        # weekly anti-yt-dlp changes.
+        "yt_dlp_n_challenge": n_challenge_probe(shutil.which("yt-dlp")),
         "youtube_transcript_api": {
             "available": _have_yt_api(),
         },
@@ -393,6 +447,19 @@ def format_human(rep: dict) -> str:
             tools.append(f"  yt_ejs     : partial — JS runtime {runtimes} is available but yt_dlp_ejs is missing. Install: `pip install yt-dlp-ejs` (into yt-dlp's Python env, not this one)")
         else:
             tools.append("  yt_ejs     : missing  (need BOTH `pip install yt-dlp-ejs` and a JS runtime like `brew install node`). YT audio downloads will fail with 'Requested format is not available'.")
+
+    # End-to-end n-challenge probe. The libs check above can be "ok"
+    # while YouTube actually rejects the solver because they shipped a
+    # new challenge variant this week. Only this probe catches that.
+    n_probe = rep.get("yt_dlp_n_challenge", {})
+    if yt_info.get("available") and n_probe:
+        status = n_probe.get("status")
+        count = n_probe.get("format_count", 0)
+        if status == "ok":
+            tools.append(f"  yt_n_chal  : ok  (end-to-end probe extracted {count} formats from test video — YouTube downloads working today)")
+        elif status == "broken":
+            err = n_probe.get("error") or "no formats returned"
+            tools.append(f"  yt_n_chal  : BROKEN ({err}) — even with libs installed, YouTube isn't serving playable formats. Try `pip install -U 'yt-dlp[default]' yt-dlp-ejs` and check yt-dlp/wiki/EJS")
     fw = rep.get("faster_whisper", {})
     if fw.get("available"):
         tools.append(f"  whisper    : ok  (faster-whisper, model={fw.get('model','small')})")

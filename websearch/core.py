@@ -366,6 +366,20 @@ _SOFT_404_PATTERNS = (
     re.compile(r"\b(?:404|page) not found\b", re.IGNORECASE),
     re.compile(r"\bthis page (?:does|doesn'?t|cannot)\s*(?:not\s+)?exists?\b", re.IGNORECASE),
     re.compile(r"\boops!?\s+(?:looks like|the page)", re.IGNORECASE),
+    # Added 2026-05-27 after observing data4ai.com and anthropic.com
+    # returning HTTP 404 wrapped in 200-OK chrome on legitimate-looking
+    # paths. These hit specific phrasings the original set missed.
+    re.compile(r"\b(?:that\s+)?(?:url|link|address) (?:is\s+)?(?:invalid|broken|expired|gone|doesn'?t exist)", re.IGNORECASE),
+    re.compile(r"\b(?:this\s+)?content (?:has\s+)?(?:been\s+)?(?:moved|removed|deleted|expired|unavailable)", re.IGNORECASE),
+    re.compile(r"\b(?:nothing|no\s+page|no\s+article) (?:here|found)\b", re.IGNORECASE),
+    re.compile(r"\bhttp(?:s)?\s*(?:status\s*)?\s*404\b", re.IGNORECASE),
+)
+# URL-path heuristics for known-bad slugs. Detecting `/404`, `/not-found`
+# etc. in the final URL is faster than scanning the body and catches the
+# case where the server 200s on an obvious error route.
+_SOFT_404_URL_RE = re.compile(
+    r"/(?:404|not[-_]found|page[-_]not[-_]found|error|missing|gone)/?(?:[?#]|$)",
+    re.IGNORECASE,
 )
 # Soft-404 detection runs only on small page bodies — long pages are
 # almost never error pages, so the regex sweep is wasted work. 8 KB is
@@ -373,8 +387,14 @@ _SOFT_404_PATTERNS = (
 _SOFT_404_MAX_BODY_BYTES = 8192
 
 
-def _looks_soft_404(html: str) -> Optional[str]:
-    """Return the matched pattern if `html` looks like a 200-OK error page."""
+def _looks_soft_404(html: str, final_url: str = "") -> Optional[str]:
+    """Return the matched pattern if `html` looks like a 200-OK error page.
+
+    Also checks `final_url` for obvious error-page slugs — caught the case
+    where a fetch is redirected through /404 but returns 200 with chrome
+    around the message."""
+    if final_url and _SOFT_404_URL_RE.search(final_url):
+        return f"final URL matches error path: {final_url}"
     if not html or len(html) > _SOFT_404_MAX_BODY_BYTES:
         return None
     for pat in _SOFT_404_PATTERNS:
@@ -482,7 +502,7 @@ def fetch_direct(
     # it and pick the next-ranked source instead of inlining a 404 page.
     soft_404_match: Optional[str] = None
     if err is None and not is_pdf and r.status_code == 200 and text:
-        soft_404_match = _looks_soft_404(text)
+        soft_404_match = _looks_soft_404(text, r.url)
         if soft_404_match:
             err = f"soft_404: matched {soft_404_match!r}"
     result = FetchResult(
@@ -1310,6 +1330,42 @@ def search_smart(
     raise RuntimeError(f"all search engines failed: {detail}")
 
 
+_ARXIV_VARIANT_RE = re.compile(
+    r"^(https?://(?:[\w.-]+\.)?arxiv\.org)/(?:abs|pdf|html|ftp/arxiv/papers/\d+)/([^/?#]+?)(?:v\d+)?(?:\.pdf)?(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_MOBILE_SUBDOMAIN_RE = re.compile(r"^(https?://)(?:m|mobile|www\.m)\.", re.IGNORECASE)
+
+
+def _canonical_url(url: str) -> str:
+    """Collapse same-document URL variants for dedup.
+
+    - arxiv.org/abs/2506.05364, /pdf/2506.05364, /pdf/2506.05364v2,
+      /pdf/2506.05364.pdf, /html/2506.05364 all canonicalize to
+      arxiv.org/abs/2506.05364.
+    - m.example.com -> www.example.com
+    - Strips trailing slashes and common tracking fragments.
+
+    Self-research surfaced two arxiv URL variants of the same paper as
+    distinct top results, both got fetched, both took a depth slot —
+    pure waste. This fix is what would have prevented that."""
+    if not url:
+        return url
+    # arxiv canonicalization first — the variants are the loudest waste case.
+    m = _ARXIV_VARIANT_RE.match(url)
+    if m:
+        return f"{m.group(1)}/abs/{m.group(2)}"
+    # Strip mobile subdomain prefix so m.example.com matches example.com.
+    url = _MOBILE_SUBDOMAIN_RE.sub(r"\1", url)
+    # Drop the fragment (anchors don't change the document).
+    if "#" in url:
+        url = url.split("#", 1)[0]
+    # Drop trailing slash for normalization.
+    if url.endswith("/") and url.count("/") > 3:
+        url = url[:-1]
+    return url
+
+
 def search_many(
     queries: Iterable[str],
     max_results: int = 10,
@@ -1361,9 +1417,13 @@ def search_many(
         merged: list[dict] = []
         for q in queries:
             for r in per_query.get(q, {}).get("results", []):
-                if r["url"] in seen:
+                # Canonicalize before dedup so the same document under
+                # different URL shapes (arxiv abs/pdf/html, m. mobile
+                # subdomains, etc.) collapses to one slot.
+                key = _canonical_url(r["url"])
+                if key in seen:
                     continue
-                seen.add(r["url"])
+                seen.add(key)
                 merged.append({**r, "from_query": q})
         # Re-apply reputation across the merged list so prefer/trust work
         # against the combined pool, not just within each query.

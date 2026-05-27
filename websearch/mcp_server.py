@@ -283,6 +283,121 @@ def build_server():
         return "Sources:\n" + "\n".join(clean)
 
     @mcp.tool()
+    def execute(code: str, timeout: int = 60) -> str:
+        """Execute a Python snippet that calls websearch tools directly.
+
+        Anthropic's "code execution with MCP" pattern: instead of the
+        model round-tripping intermediate tool results through its
+        context (search -> N URLs -> N fetches -> filter -> summarize),
+        let the model write one script that chains the calls. Only the
+        final value or printed output returns to the model context,
+        which can be 10-100x cheaper for multi-step workflows.
+
+        Available functions in the script's namespace:
+            search(query, max_results=10, trust='medium') -> list[dict]
+            fetch(url, max_chars=4000) -> dict {'url','status','body','error'}
+            research(question, related=None, depth=5) -> str (markdown)
+            papers(query, year_min=None, ...) -> str
+            json: the json module, pre-imported for convenience.
+
+        Return value protocol: assign to `result` (any type — will be
+        str()'d) OR print to stdout. If both, `result` wins.
+
+        Trust model: code runs in the websearch process's Python
+        interpreter with full user permissions. The MCP transport is
+        the trust boundary. Don't expose this server over an untrusted
+        network or to agents you wouldn't give shell access to.
+
+        Args:
+            code: Python source. Multi-line OK. Tabs/spaces both fine.
+            timeout: max seconds to run (default 60).
+
+        Returns:
+            String. On error: "ERROR: <type>: <message>\\n<traceback>\\n
+            ---stdout---\\n<captured>". On success: the str(result) if
+            `result` was set, else captured stdout, else
+            "(no output)".
+        """
+        import contextlib
+        import io
+        import json as _json
+        import signal
+        import traceback
+
+        # Build the namespace the agent's script will see. Each tool
+        # function returns a dict/list/str — JSON-friendly types so
+        # the agent can json.dumps the final result if it wants.
+        def _search(query, max_results=10, trust="medium"):
+            engine, results = search_smart(query, max_results=max_results, trust=trust)
+            return [
+                {"rank": r.rank, "title": r.title, "url": r.url, "snippet": r.snippet}
+                for r in results
+            ]
+
+        def _fetch(url, max_chars=4000):
+            unsafe = _url_safety_error(url)
+            if unsafe:
+                return {"url": url, "status": 0, "body": "",
+                        "error": f"refused: {unsafe}"}
+            res = fetch_smart(url, cache=default_cache())
+            body = html_to_text(res.text, max_chars=max_chars) if res.text else ""
+            return {
+                "url": url,
+                "final_url": res.final_url,
+                "status": res.status,
+                "via": res.via,
+                "body": body,
+                "error": res.error,
+            }
+
+        def _research(question, related=None, depth=5):
+            return research(question, related_queries=related, depth=depth)
+
+        def _papers(query, max_results=5, year_min=None, year_max=None,
+                    min_citations=None, oa_only=False):
+            return papers(query, max_results=max_results, year_min=year_min,
+                          year_max=year_max, min_citations=min_citations,
+                          oa_only=oa_only)
+
+        namespace: dict = {
+            "search": _search,
+            "fetch": _fetch,
+            "research": _research,
+            "papers": _papers,
+            "json": _json,
+            "__builtins__": __builtins__,
+        }
+
+        # SIGALRM-based timeout. Only works on POSIX; on Windows fall
+        # through to no timeout (still better than nothing). The handler
+        # raises TimeoutError which the exec catches like any other.
+        prev_handler = None
+        if hasattr(signal, "SIGALRM"):
+            def _timeout_handler(signum, frame):
+                raise TimeoutError(f"execute() exceeded {timeout}s budget")
+            prev_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(int(timeout))
+
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(code, namespace)
+        except Exception as e:  # noqa: BLE001
+            tb = traceback.format_exc()
+            return (f"ERROR: {type(e).__name__}: {e}\n{tb}"
+                    f"\n---stdout---\n{buf.getvalue()}")
+        finally:
+            if hasattr(signal, "SIGALRM"):
+                signal.alarm(0)
+                if prev_handler is not None:
+                    signal.signal(signal.SIGALRM, prev_handler)
+
+        if "result" in namespace:
+            return str(namespace["result"])
+        out = buf.getvalue()
+        return out if out else "(no output and no `result` variable set)"
+
+    @mcp.tool()
     def papers(
         query: str,
         max_results: int = 5,

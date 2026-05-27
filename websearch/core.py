@@ -213,6 +213,10 @@ class FetchResult:
     tried_wayback: bool = False
     wayback_status: Optional[int] = None
     wayback_error: Optional[str] = None
+    # Populated by cli._enforce_since when --enforce-since runs and a date is
+    # extractable from the body. Declared here so asdict() preserves it; the
+    # render path also re-extracts when this is unset.
+    published_date: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

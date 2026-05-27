@@ -163,10 +163,13 @@ class Cache:
 
 
 _default: Optional[Cache] = None
+_default_lock = threading.Lock()
 
 
 def default() -> Cache:
     global _default
     if _default is None:
-        _default = Cache()
+        with _default_lock:
+            if _default is None:
+                _default = Cache()
     return _default

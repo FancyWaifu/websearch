@@ -313,7 +313,7 @@ def fetch_related_articles(
             cache=cache if cache is not None else default_cache(),
             max_age=max_age, refresh=refresh, proxy=proxy,
         )
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         return []
     return [
         {

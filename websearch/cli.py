@@ -191,11 +191,11 @@ def _enforce_since(fetched: list, since: str) -> list:
             continue
         pub = _dates.extract_published(body)
         if pub is None or pub >= cutoff:
-            # Annotate for the renderer
-            if hasattr(r, "__dict__"):
-                setattr(r, "published_date", pub.isoformat() if pub else None)
-            elif isinstance(r, dict):
-                r["published_date"] = pub.isoformat() if pub else None
+            iso = pub.isoformat() if pub else None
+            if isinstance(r, dict):
+                r["published_date"] = iso
+            else:
+                r.published_date = iso
             out.append(r)
     return out
 
@@ -373,13 +373,20 @@ def _attach_fetched(container: dict, fetched: list, args: argparse.Namespace) ->
     mtc = getattr(args, "max_total_chars", None)
     if mtc and fetched:
         per = max(600, mtc // len(fetched))
-        kw["max_chars"] = min(kw["max_chars"], per) if kw.get("max_chars") else per
+        # max_chars=0 is an explicit "no per-source cap" and must not be
+        # treated as unset; only None falls through to `per`.
+        existing = kw.get("max_chars")
+        if existing is None:
+            kw["max_chars"] = per
+        elif existing > 0:
+            kw["max_chars"] = min(existing, per)
+        # else: existing == 0, leave it as 0 (user opted out of per-source cap)
     for fr in fetched:
         d = fr.to_dict()
         body = d.pop("text", "")
         # Surface the page's published date inline (best-effort, from the
         # raw HTML before extraction strips the <meta>/JSON-LD tags).
-        if "published_date" not in d:
+        if not d.get("published_date"):
             looks_html = "html" in (fr.content_type or "").lower() or body.lstrip().startswith("<")
             pub = _dates.extract_published(body) if looks_html else None
             d["published_date"] = pub.isoformat() if pub else None

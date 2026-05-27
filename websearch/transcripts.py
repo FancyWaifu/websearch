@@ -79,7 +79,7 @@ def fetch_transcript(url: str, timeout: int = 60, lang: str = "en") -> tuple[str
             "--sub-lang", lang,
             "--sub-format", "vtt",
             "-o", out_tpl,
-            url,
+            "--", url,
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)

@@ -68,7 +68,10 @@ def edit_user_list(kind: str, domain: str, remove: bool = False) -> str:
     if kind not in ("block", "allow"):
         raise ValueError("kind must be 'block' or 'allow'")
     fname = _USER_BLOCK_FILE if kind == "block" else _USER_ALLOW_FILE
-    domain = domain_of(domain) or domain.strip().lower().lstrip("www.")
+    raw = domain.strip().lower()
+    if raw.startswith("www."):
+        raw = raw[4:]
+    domain = domain_of(domain) or raw
     USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     p = USER_CONFIG_DIR / fname
     current = _load_domain_file(fname)
